@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2025-12-04
+
+### Added
+
+- **ROLE_ANONYMOUS constant** (`0x80000000`) - Reserved bit 31 for anonymous/public access
+  - Solves the problem where `roles = 0` could never match any rule
+  - Use with `HeaderRoleExtractor::with_default_roles(ROLE_ANONYMOUS)`
+  - Exported in prelude
+- **`with_id_extractor()` method** on `AclLayer` - Configure custom ID extraction
+  - Enables ownership-based access control (e.g., users can only access their own resources)
+  - Mirrors the existing `with_role_extractor()` pattern
+- **`with_role_extractor()` method** - Renamed from `with_extractor()` for clarity
+
+### Changed
+
+- `AclLayer` now has two type parameters: `AclLayer<E, I>` (role extractor, ID extractor)
+- `AclConfig` and `AclMiddleware` updated to match
+- Default ID extractor changed from header-based to `HeaderIdExtractor::new("X-User-Id")`
+- Renamed `extractor` field to `role_extractor` in `AclConfig`
+
+### Deprecated
+
+- `with_extractor()` - Use `with_role_extractor()` instead
+
+### Removed
+
+- `with_id_header()` method - Use `with_id_extractor(HeaderIdExtractor::new("header-name"))` instead
+- `id_header` field from `AclConfig` - Replaced by `id_extractor`
+
 ## [0.1.0] - 2024-12-04
 
 ### Added
@@ -36,4 +65,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - No unsafe code (`#![forbid(unsafe_code)]`)
 
+[0.2.0]: https://github.com/greenpdx/axum-acl/releases/tag/v0.2.0
 [0.1.0]: https://github.com/greenpdx/axum-acl/releases/tag/v0.1.0

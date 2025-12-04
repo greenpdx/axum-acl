@@ -163,7 +163,7 @@ async fn main() {
         .route("/business", get(business_hours_endpoint))
         .route("/internal/metrics", get(internal_endpoint))
         // Apply ACL layer with custom extractor
-        .layer(AclLayer::new(acl_table).with_extractor(AuthUserRoleExtractor))
+        .layer(AclLayer::new(acl_table).with_role_extractor(AuthUserRoleExtractor))
         // Auth middleware runs first (before ACL)
         .layer(middleware::from_fn(auth_middleware));
 

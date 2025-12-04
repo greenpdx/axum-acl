@@ -238,6 +238,33 @@
 #![warn(rustdoc::missing_crate_level_docs)]
 #![forbid(unsafe_code)]
 
+/// Role bitmask constant for anonymous/unauthenticated users.
+///
+/// This constant uses bit 31 (0x80000000) as a convention for anonymous access.
+/// Bits 0-30 remain available for application-defined roles.
+///
+/// # Usage
+///
+/// Use this with `HeaderRoleExtractor::with_default_roles()` to allow
+/// anonymous users to match public endpoint rules:
+///
+/// ```rust
+/// use axum_acl::{AclLayer, AclTable, AclRuleFilter, AclAction, HeaderRoleExtractor, ROLE_ANONYMOUS};
+///
+/// let table = AclTable::builder()
+///     .default_action(AclAction::Deny)
+///     // Public endpoints: allow all roles including anonymous
+///     .add_prefix("/public/", AclRuleFilter::new()
+///         .role_mask(u32::MAX)  // All roles including ROLE_ANONYMOUS
+///         .action(AclAction::Allow))
+///     .build();
+///
+/// let layer = AclLayer::new(table)
+///     .with_extractor(HeaderRoleExtractor::new("X-Roles")
+///         .with_default_roles(ROLE_ANONYMOUS));
+/// ```
+pub const ROLE_ANONYMOUS: u32 = 0x8000_0000;
+
 mod config;
 mod error;
 mod extractor;
@@ -275,4 +302,5 @@ pub mod prelude {
     pub use crate::middleware::AclLayer;
     pub use crate::rule::{AclAction, AclRuleFilter, EndpointPattern, IpMatcher, RequestContext, TimeWindow};
     pub use crate::table::{AclRuleProvider, AclTable, RuleEntry};
+    pub use crate::ROLE_ANONYMOUS;
 }

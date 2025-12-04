@@ -1,0 +1,185 @@
+# =============================================================================
+# axum-acl TOML Configuration Example
+# =============================================================================
+#
+# This file demonstrates all configuration options for axum-acl.
+#
+# TOML Format Notes:
+# - action: "allow", "deny", or { type = "...", ... } for complex actions
+# - role_mask: number (3) or string ("0xFF" or "*")
+# - endpoint: parsed automatically - "/" for prefix, "*" or "**" for glob
+# - time: { start = 9, end = 17, days = [0,1,2,3,4] }
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Global Settings
+# -----------------------------------------------------------------------------
+[settings]
+default_action = "deny"
+
+# =============================================================================
+# PUBLIC ENDPOINTS
+# =============================================================================
+
+[[rules]]
+endpoint = "/"
+role_mask = "*"
+action = "allow"
+description = "Public homepage"
+
+[[rules]]
+endpoint = "/api/public/"
+role_mask = "*"
+action = "allow"
+description = "All public API endpoints (prefix match)"
+
+[[rules]]
+endpoint = "/api/health"
+role_mask = "*"
+action = { type = "log", level = "info", message = "Health check accessed" }
+description = "Health check - logged for monitoring"
+
+# =============================================================================
+# USER ENDPOINTS
+# =============================================================================
+
+[[rules]]
+endpoint = "/api/users"
+role_mask = 3
+action = "allow"
+description = "List users - requires user or admin role"
+
+# Admin can access any user profile (higher priority - listed first)
+[[rules]]
+endpoint = "/api/users/*/profile"
+role_mask = 1
+action = "allow"
+priority = 10
+description = "Admin can view any user profile"
+
+# Users can only access their own profile
+[[rules]]
+endpoint = "/api/users/{id}/profile"
+role_mask = 2
+id = "{id}"
+action = "allow"
+priority = 20
+description = "Users can only view their own profile"
+
+# =============================================================================
+# ADMIN ENDPOINTS - Role + IP restriction
+# =============================================================================
+
+[[rules]]
+endpoint = "/api/admin/"
+role_mask = 1
+ip = "127.0.0.1"
+action = "allow"
+description = "Admin endpoints - localhost IPv4 only"
+
+[[rules]]
+endpoint = "/api/admin/"
+role_mask = 1
+ip = "::1"
+action = "allow"
+description = "Admin endpoints - localhost IPv6"
+
+[[rules]]
+endpoint = "/api/admin/"
+role_mask = 1
+ip = "192.168.0.0/16"
+action = "allow"
+description = "Admin endpoints - private network"
+
+# =============================================================================
+# TIME-RESTRICTED ENDPOINTS
+# =============================================================================
+
+[[rules]]
+endpoint = "/api/reports"
+role_mask = 3
+time = { start = 9, end = 17, days = [0, 1, 2, 3, 4] }
+action = "allow"
+description = "Reports - business hours Mon-Fri 9-17 UTC"
+
+# =============================================================================
+# GLOB PATTERNS
+# =============================================================================
+
+[[rules]]
+endpoint = "/api/data/*/export"
+role_mask = 3
+action = "allow"
+description = "Export any resource type"
+
+[[rules]]
+endpoint = "/api/**/logs"
+role_mask = 1
+action = "allow"
+description = "Access logs at any depth"
+
+# =============================================================================
+# REROUTE / REDIRECT
+# =============================================================================
+
+[[rules]]
+endpoint = "/old-api"
+role_mask = "*"
+action = { type = "reroute", target = "/api/v2" }
+description = "Redirect legacy API to v2"
+
+[[rules]]
+endpoint = "/legacy/"
+role_mask = "*"
+action = { type = "reroute", target = "/api/v2", preserve_path = true }
+description = "Redirect all legacy endpoints"
+
+[[rules]]
+endpoint = "/api/v2"
+role_mask = "*"
+action = "allow"
+description = "New API v2 endpoint"
+
+# =============================================================================
+# CUSTOM ERROR RESPONSES
+# =============================================================================
+
+[[rules]]
+endpoint = "/deprecated"
+role_mask = "*"
+action = { type = "error", code = 410, message = "This endpoint has been permanently removed" }
+description = "Deprecated endpoint returns 410 Gone"
+
+[[rules]]
+endpoint = "/internal/"
+role_mask = "*"
+action = { type = "error", code = 503, message = "Service temporarily unavailable" }
+description = "Internal endpoints return 503"
+
+# =============================================================================
+# IP-BASED RULES
+# =============================================================================
+
+[[rules]]
+endpoint = "/api/webhook"
+ip = "203.0.113.50"
+action = "allow"
+description = "Allow webhook from trusted IP"
+
+# =============================================================================
+# CATCH-ALL RULES (evaluated last)
+# =============================================================================
+
+[[rules]]
+endpoint = "*"
+role_mask = 4
+action = { type = "log", level = "debug" }
+priority = 1000
+description = "Log all viewer access attempts"
+
+[[rules]]
+endpoint = "*"
+action = "deny"
+priority = 9999
+description = "Deny all unmatched requests"

@@ -4,7 +4,7 @@
 //! integrate with axum's middleware system.
 
 use crate::error::{AccessDenied, AccessDeniedHandler, DefaultDeniedHandler};
-use crate::extractor::{HeaderRoleExtractor, RoleExtractor};
+use crate::extractor::{HeaderIdExtractor, HeaderRoleExtractor, IdExtractor, RoleExtractor};
 use crate::rule::{AclAction, RequestContext};
 use crate::table::AclTable;
 
@@ -19,33 +19,33 @@ use std::task::{Context, Poll};
 use tower::{Layer, Service};
 
 /// Configuration for the ACL middleware.
-pub struct AclConfig<E> {
+pub struct AclConfig<E, I> {
     /// The ACL table containing the rules.
     pub table: Arc<AclTable>,
     /// The role extractor.
-    pub extractor: Arc<E>,
+    pub role_extractor: Arc<E>,
+    /// The ID extractor.
+    pub id_extractor: Arc<I>,
     /// The handler for access denied responses.
     pub denied_handler: Arc<dyn AccessDeniedHandler>,
     /// The roles bitmask to use for anonymous users.
     pub anonymous_roles: u32,
     /// Header to check for forwarded IP (e.g., X-Forwarded-For).
     pub forwarded_ip_header: Option<String>,
-    /// Header to extract the user/session ID from.
-    pub id_header: Option<String>,
-    /// Default ID when header is missing.
+    /// Default ID when ID extractor returns anonymous.
     pub default_id: String,
 }
 
-// Manual Clone impl to avoid requiring E: Clone (since E is behind Arc)
-impl<E> Clone for AclConfig<E> {
+// Manual Clone impl to avoid requiring E/I: Clone (since they're behind Arc)
+impl<E, I> Clone for AclConfig<E, I> {
     fn clone(&self) -> Self {
         Self {
             table: self.table.clone(),
-            extractor: self.extractor.clone(),
+            role_extractor: self.role_extractor.clone(),
+            id_extractor: self.id_extractor.clone(),
             denied_handler: self.denied_handler.clone(),
             anonymous_roles: self.anonymous_roles,
             forwarded_ip_header: self.forwarded_ip_header.clone(),
-            id_header: self.id_header.clone(),
             default_id: self.default_id.clone(),
         }
     }
@@ -84,44 +84,84 @@ impl<E> Clone for AclConfig<E> {
 /// }
 /// ```
 #[derive(Clone)]
-pub struct AclLayer<E> {
-    config: AclConfig<E>,
+pub struct AclLayer<E, I> {
+    config: AclConfig<E, I>,
 }
 
-impl AclLayer<HeaderRoleExtractor> {
+impl AclLayer<HeaderRoleExtractor, HeaderIdExtractor> {
     /// Create a new ACL layer with the given table.
     ///
-    /// Uses the default header role extractor (`X-Roles` header) and
+    /// Uses the default header role extractor (`X-Roles` header),
+    /// default header ID extractor (`X-User-Id` header), and
     /// default denied handler (plain text 403).
     pub fn new(table: AclTable) -> Self {
         Self {
             config: AclConfig {
                 table: Arc::new(table),
-                extractor: Arc::new(HeaderRoleExtractor::new("X-Roles")),
+                role_extractor: Arc::new(HeaderRoleExtractor::new("X-Roles")),
+                id_extractor: Arc::new(HeaderIdExtractor::new("X-User-Id")),
                 denied_handler: Arc::new(DefaultDeniedHandler),
                 anonymous_roles: 0,
                 forwarded_ip_header: None,
-                id_header: Some("X-Request-ID".to_string()),
                 default_id: "*".to_string(),
             },
         }
     }
 }
 
-impl<E> AclLayer<E> {
+impl<E, I> AclLayer<E, I> {
     /// Create a new ACL layer with a custom role extractor.
-    pub fn with_extractor<E2>(self, extractor: E2) -> AclLayer<E2> {
+    ///
+    /// # Example
+    /// ```
+    /// use axum_acl::{AclLayer, AclTable, HeaderRoleExtractor};
+    ///
+    /// let table = AclTable::new();
+    /// let layer = AclLayer::new(table)
+    ///     .with_role_extractor(HeaderRoleExtractor::new("X-User-Roles"));
+    /// ```
+    pub fn with_role_extractor<E2>(self, extractor: E2) -> AclLayer<E2, I> {
         AclLayer {
             config: AclConfig {
                 table: self.config.table,
-                extractor: Arc::new(extractor),
+                role_extractor: Arc::new(extractor),
+                id_extractor: self.config.id_extractor,
                 denied_handler: self.config.denied_handler,
                 anonymous_roles: self.config.anonymous_roles,
                 forwarded_ip_header: self.config.forwarded_ip_header,
-                id_header: self.config.id_header,
                 default_id: self.config.default_id,
             },
         }
+    }
+
+    /// Create a new ACL layer with a custom ID extractor.
+    ///
+    /// # Example
+    /// ```
+    /// use axum_acl::{AclLayer, AclTable, HeaderIdExtractor};
+    ///
+    /// let table = AclTable::new();
+    /// let layer = AclLayer::new(table)
+    ///     .with_id_extractor(HeaderIdExtractor::new("X-User-Id"));
+    /// ```
+    pub fn with_id_extractor<I2>(self, extractor: I2) -> AclLayer<E, I2> {
+        AclLayer {
+            config: AclConfig {
+                table: self.config.table,
+                role_extractor: self.config.role_extractor,
+                id_extractor: Arc::new(extractor),
+                denied_handler: self.config.denied_handler,
+                anonymous_roles: self.config.anonymous_roles,
+                forwarded_ip_header: self.config.forwarded_ip_header,
+                default_id: self.config.default_id,
+            },
+        }
+    }
+
+    /// Create a new ACL layer with a custom role extractor.
+    #[deprecated(since = "0.2.0", note = "Use with_role_extractor instead")]
+    pub fn with_extractor<E2>(self, extractor: E2) -> AclLayer<E2, I> {
+        self.with_role_extractor(extractor)
     }
 
     /// Set a custom access denied handler.
@@ -145,13 +185,7 @@ impl<E> AclLayer<E> {
         self
     }
 
-    /// Set a header to extract the user/session ID from.
-    pub fn with_id_header(mut self, header: impl Into<String>) -> Self {
-        self.config.id_header = Some(header.into());
-        self
-    }
-
-    /// Set the default ID to use when the ID header is missing.
+    /// Set the default ID to use when the ID extractor returns anonymous.
     pub fn with_default_id(mut self, id: impl Into<String>) -> Self {
         self.config.default_id = id.into();
         self
@@ -163,8 +197,8 @@ impl<E> AclLayer<E> {
     }
 }
 
-impl<S, E: Clone> Layer<S> for AclLayer<E> {
-    type Service = AclMiddleware<S, E>;
+impl<S, E: Clone, I: Clone> Layer<S> for AclLayer<E, I> {
+    type Service = AclMiddleware<S, E, I>;
 
     fn layer(&self, inner: S) -> Self::Service {
         AclMiddleware {
@@ -176,16 +210,17 @@ impl<S, E: Clone> Layer<S> for AclLayer<E> {
 
 /// The ACL middleware service.
 #[derive(Clone)]
-pub struct AclMiddleware<S, E> {
+pub struct AclMiddleware<S, E, I> {
     inner: S,
-    config: AclConfig<E>,
+    config: AclConfig<E, I>,
 }
 
-impl<S, E, ReqBody, ResBody> Service<Request<ReqBody>> for AclMiddleware<S, E>
+impl<S, E, I, ReqBody, ResBody> Service<Request<ReqBody>> for AclMiddleware<S, E, I>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send,
     E: RoleExtractor<ReqBody> + 'static,
+    I: IdExtractor<ReqBody> + 'static,
     ReqBody: Body + Send + 'static,
     ResBody: Body + Default + Send + 'static,
 {
@@ -202,14 +237,15 @@ where
         let mut inner = self.inner.clone();
 
         // Extract roles bitmask synchronously before entering the async block
-        let role_result = config.extractor.extract_roles(&request);
+        let role_result = config.role_extractor.extract_roles(&request);
         let roles = role_result.roles_or(config.anonymous_roles);
 
         // Extract client IP synchronously
         let client_ip = extract_client_ip(&request, config.forwarded_ip_header.as_deref());
 
-        // Extract user/session ID
-        let id = extract_id(&request, config.id_header.as_deref(), &config.default_id);
+        // Extract user/session ID using the configured extractor
+        let id_result = config.id_extractor.extract_id(&request);
+        let id = id_result.id_or(&config.default_id);
 
         // Get request path
         let path = request.uri().path().to_string();
@@ -363,20 +399,6 @@ fn extract_client_ip<B>(request: &Request<B>, forwarded_header: Option<&str>) ->
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip())
-}
-
-/// Extract the user/session ID from the request.
-fn extract_id<B>(request: &Request<B>, id_header: Option<&str>, default: &str) -> String {
-    if let Some(header_name) = id_header {
-        if let Some(value) = request.headers().get(header_name) {
-            if let Ok(s) = value.to_str() {
-                if !s.is_empty() {
-                    return s.to_string();
-                }
-            }
-        }
-    }
-    default.to_string()
 }
 
 #[cfg(test)]
