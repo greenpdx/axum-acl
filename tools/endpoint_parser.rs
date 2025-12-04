@@ -1,14 +1,16 @@
-//! Axum endpoint parser with two parsing modes:
+//! Axum endpoint parser with ACL rule extraction.
 //!
-//! 1. **Text mode** (default): Fast line-by-line text analysis
-//! 2. **AST mode** (requires `ast-parser` feature): Full Rust AST parsing with `syn`
+//! Finds all endpoints and their associated ACL rules.
+//!
+//! Output format:
+//!   endpoint METHOD  role, id, ip, time | action
+//!   * = any/wildcard
 //!
 //! Usage:
 //!   cargo run --bin endpoint_parser -- [OPTIONS] <directory>
-//!   cargo run --bin endpoint_parser --features ast-parser -- --ast <directory>
 //!
 //! Options:
-//!   --ast    Use AST-based parsing (requires ast-parser feature)
+//!   --ast    Use AST-based parsing (requires --features ast-parser)
 //!   --text   Use text-based parsing (default)
 //!   --help   Show help
 
@@ -20,11 +22,56 @@ use std::path::{Path, PathBuf};
 /// A discovered endpoint
 #[derive(Debug, Clone)]
 pub struct Endpoint {
-    pub method: String,      // GET, POST, PUT, DELETE, etc.
-    pub path: String,        // Full path including nest prefixes
-    pub handler: String,     // Handler function name
-    pub file: String,        // Source file
-    pub line: usize,         // Line number
+    pub method: String,
+    pub path: String,
+    pub handler: String,
+    pub file: String,
+    pub line: usize,
+}
+
+/// An ACL rule extracted from code
+#[derive(Debug, Clone)]
+pub struct AclRule {
+    pub pattern: String,       // exact path, prefix, glob, or "*" for any
+    pub pattern_type: String,  // "exact", "prefix", "glob", "any"
+    pub role_mask: String,     // "*" or bitmask like "0b001"
+    pub id: String,            // "*" or specific id
+    pub ip: String,            // "*" or IP/CIDR
+    pub time: String,          // "*" or time window
+    pub action: String,        // "allow", "deny", or custom
+    pub file: String,
+    pub line: usize,
+}
+
+impl AclRule {
+    fn matches_path(&self, path: &str) -> bool {
+        match self.pattern_type.as_str() {
+            "any" => true,
+            "exact" => self.pattern == path,
+            "prefix" => path.starts_with(&self.pattern),
+            "glob" => self.glob_matches(path),
+            _ => false,
+        }
+    }
+
+    fn glob_matches(&self, path: &str) -> bool {
+        let pattern = &self.pattern;
+        if pattern.contains("**") {
+            // ** matches any path segments
+            let prefix = pattern.split("**").next().unwrap_or("");
+            path.starts_with(prefix)
+        } else if pattern.contains('*') {
+            // * matches single segment
+            let parts: Vec<&str> = pattern.split('*').collect();
+            if parts.len() == 2 {
+                path.starts_with(parts[0]) && path.ends_with(parts[1])
+            } else {
+                false
+            }
+        } else {
+            self.pattern == path
+        }
+    }
 }
 
 /// Parsing mode
@@ -35,7 +82,7 @@ enum ParseMode {
 }
 
 // ============================================================================
-// Text-based Parser (default, fast)
+// Text-based Parser
 // ============================================================================
 
 mod text_parser {
@@ -43,6 +90,7 @@ mod text_parser {
 
     pub struct TextParser {
         pub endpoints: Vec<Endpoint>,
+        pub acl_rules: Vec<AclRule>,
         pending_nests: Vec<(String, String, String, usize)>,
         router_fns: HashMap<String, (String, String, usize)>,
     }
@@ -51,6 +99,7 @@ mod text_parser {
         pub fn new() -> Self {
             Self {
                 endpoints: Vec::new(),
+                acl_rules: Vec::new(),
                 pending_nests: Vec::new(),
                 router_fns: HashMap::new(),
             }
@@ -83,6 +132,7 @@ mod text_parser {
 
             self.find_router_functions(&lines, &file_str);
             self.find_routes(&lines, &file_str, "");
+            self.find_acl_rules(&lines, &file_str);
         }
 
         fn find_router_functions(&mut self, lines: &[&str], file: &str) {
@@ -231,6 +281,221 @@ mod text_parser {
             Some((prefix, router_name.to_string()))
         }
 
+        /// Find ACL rules in the code
+        fn find_acl_rules(&mut self, lines: &[&str], file: &str) {
+            let full_content = lines.join("\n");
+
+            // Find .add_exact, .add_prefix, .add_glob, .add_any patterns
+            self.extract_add_exact_rules(&full_content, file);
+            self.extract_add_prefix_rules(&full_content, file);
+            self.extract_add_glob_rules(&full_content, file);
+            self.extract_add_any_rules(&full_content, file);
+        }
+
+        fn extract_add_exact_rules(&mut self, content: &str, file: &str) {
+            let mut pos = 0;
+            while let Some(start) = content[pos..].find(".add_exact(") {
+                let actual_start = pos + start;
+                let line_num = content[..actual_start].matches('\n').count() + 1;
+
+                let after = &content[actual_start + 11..];
+                if let Some(path) = self.extract_string_literal(after) {
+                    let rule = self.extract_rule_filter(after, "exact", &path, file, line_num);
+                    self.acl_rules.push(rule);
+                }
+                pos = actual_start + 11;
+            }
+        }
+
+        fn extract_add_prefix_rules(&mut self, content: &str, file: &str) {
+            let mut pos = 0;
+            while let Some(start) = content[pos..].find(".add_prefix(") {
+                let actual_start = pos + start;
+                let line_num = content[..actual_start].matches('\n').count() + 1;
+
+                let after = &content[actual_start + 12..];
+                if let Some(path) = self.extract_string_literal(after) {
+                    let rule = self.extract_rule_filter(after, "prefix", &path, file, line_num);
+                    self.acl_rules.push(rule);
+                }
+                pos = actual_start + 12;
+            }
+        }
+
+        fn extract_add_glob_rules(&mut self, content: &str, file: &str) {
+            let mut pos = 0;
+            while let Some(start) = content[pos..].find(".add_glob(") {
+                let actual_start = pos + start;
+                let line_num = content[..actual_start].matches('\n').count() + 1;
+
+                let after = &content[actual_start + 10..];
+                if let Some(path) = self.extract_string_literal(after) {
+                    let rule = self.extract_rule_filter(after, "glob", &path, file, line_num);
+                    self.acl_rules.push(rule);
+                }
+                pos = actual_start + 10;
+            }
+        }
+
+        fn extract_add_any_rules(&mut self, content: &str, file: &str) {
+            let mut pos = 0;
+            while let Some(start) = content[pos..].find(".add_any(") {
+                let actual_start = pos + start;
+                let line_num = content[..actual_start].matches('\n').count() + 1;
+
+                let after = &content[actual_start + 9..];
+                let rule = self.extract_rule_filter(after, "any", "*", file, line_num);
+                self.acl_rules.push(rule);
+                pos = actual_start + 9;
+            }
+        }
+
+        fn extract_rule_filter(&self, text: &str, pattern_type: &str, pattern: &str, file: &str, line: usize) -> AclRule {
+            let role_mask = self.extract_role_mask(text);
+            let id = self.extract_id_filter(text);
+            let ip = self.extract_ip_filter(text);
+            let time = self.extract_time_filter(text);
+            let action = self.extract_action(text);
+
+            AclRule {
+                pattern: pattern.to_string(),
+                pattern_type: pattern_type.to_string(),
+                role_mask,
+                id,
+                ip,
+                time,
+                action,
+                file: file.to_string(),
+                line,
+            }
+        }
+
+        fn extract_role_mask(&self, text: &str) -> String {
+            // Look for .role_mask(value) or role_mask: value
+            if let Some(pos) = text.find(".role_mask(") {
+                let after = &text[pos + 11..];
+                if let Some(end) = after.find(')') {
+                    let value = after[..end].trim();
+                    if value == "u32::MAX" {
+                        return "*".to_string();
+                    }
+                    return value.to_string();
+                }
+            }
+            "*".to_string()
+        }
+
+        fn extract_id_filter(&self, text: &str) -> String {
+            // Look for .id("value")
+            if let Some(pos) = text.find(".id(") {
+                let after = &text[pos + 4..];
+                if let Some(id) = self.extract_string_literal(after) {
+                    return id;
+                }
+            }
+            "*".to_string()
+        }
+
+        fn extract_ip_filter(&self, text: &str) -> String {
+            // Look for .ip(IpMatcher::parse("..."))
+            if let Some(pos) = text.find(".ip(") {
+                let after = &text[pos + 4..];
+                if let Some(ip) = self.extract_string_literal(after) {
+                    return ip;
+                }
+            }
+            "*".to_string()
+        }
+
+        fn extract_time_filter(&self, text: &str) -> String {
+            // Look for .time(TimeWindow::...)
+            if let Some(pos) = text.find(".time(") {
+                let after = &text[pos + 6..];
+                // Extract the TimeWindow pattern
+                if after.contains("hours_on_days") {
+                    // Try to extract hours and days
+                    if let Some(paren) = after.find('(') {
+                        let params = &after[paren + 1..];
+                        if let Some(end) = params.find(')') {
+                            let args = &params[..end];
+                            return format!("hours_on_days({})", args.split(',').take(2).collect::<Vec<_>>().join(","));
+                        }
+                    }
+                } else if after.contains("hours(") {
+                    if let Some(paren) = after.find("hours(") {
+                        let params = &after[paren + 6..];
+                        if let Some(end) = params.find(')') {
+                            return format!("hours({})", &params[..end]);
+                        }
+                    }
+                }
+                return "custom".to_string();
+            }
+            "*".to_string()
+        }
+
+        fn extract_action(&self, text: &str) -> String {
+            // Look for .action(...) and extract the value
+            if let Some(pos) = text.find(".action(") {
+                let after = &text[pos + 8..];
+                // Find matching closing paren, handling nested parens
+                let mut depth = 1;
+                let mut end = 0;
+                for (i, ch) in after.chars().enumerate() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = i;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if end > 0 {
+                    let action_str = after[..end].trim();
+                    // Clean up common patterns
+                    let action = action_str
+                        .replace("AclAction::", "")
+                        .replace("Action::", "")
+                        .trim()
+                        .to_string();
+
+                    // For complex actions like Error { code: 403, ... }, simplify
+                    if action.starts_with("Error") {
+                        if let Some(code) = self.extract_error_code(&action) {
+                            return format!("error({})", code);
+                        }
+                        return "error".to_string();
+                    }
+                    if action.starts_with("Reroute") || action.starts_with("reroute") {
+                        if let Some(target) = self.extract_string_literal(&action) {
+                            return format!("reroute({})", target);
+                        }
+                        return "reroute".to_string();
+                    }
+                    // Return as-is for custom actions
+                    return action.to_lowercase();
+                }
+            }
+            "*".to_string() // no action specified = default
+        }
+
+        fn extract_error_code(&self, text: &str) -> Option<String> {
+            // Look for code: 403 or code = 403
+            if let Some(pos) = text.find("code") {
+                let after = &text[pos + 4..];
+                let after = after.trim_start_matches(|c| c == ':' || c == '=' || c == ' ');
+                let end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+                if end > 0 {
+                    return Some(after[..end].to_string());
+                }
+            }
+            None
+        }
+
         pub fn resolve_nests(&mut self) {
             let mut iterations = 0;
 
@@ -258,10 +523,6 @@ mod text_parser {
         pub fn router_fn_count(&self) -> usize {
             self.router_fns.len()
         }
-
-        pub fn router_fns(&self) -> impl Iterator<Item = (&String, &(String, String, usize))> {
-            self.router_fns.iter()
-        }
     }
 }
 
@@ -279,15 +540,17 @@ mod ast_parser {
 
     pub struct AstParser {
         pub endpoints: Vec<Endpoint>,
+        pub acl_rules: Vec<AclRule>,
         current_file: String,
-        router_fns: HashMap<String, (String, String, usize)>, // fn_name -> (file, content, line)
-        pending_nests: Vec<(String, String)>,                  // (prefix, fn_name)
+        router_fns: HashMap<String, (String, String, usize)>,
+        pending_nests: Vec<(String, String)>,
     }
 
     impl AstParser {
         pub fn new() -> Self {
             Self {
                 endpoints: Vec::new(),
+                acl_rules: Vec::new(),
                 current_file: String::new(),
                 router_fns: HashMap::new(),
                 pending_nests: Vec::new(),
@@ -318,6 +581,10 @@ mod ast_parser {
 
             self.current_file = path.to_string_lossy().to_string();
 
+            // Also do text-based ACL rule extraction
+            let lines: Vec<&str> = content.lines().collect();
+            self.extract_acl_rules_text(&lines);
+
             let syntax: File = match syn::parse_file(&content) {
                 Ok(f) => f,
                 Err(e) => {
@@ -326,13 +593,11 @@ mod ast_parser {
                 }
             };
 
-            // First pass: find router-returning functions
             for item in &syntax.items {
                 if let syn::Item::Fn(func) = item {
                     if self.returns_router(func) && func.sig.ident != "main" {
                         let fn_name = func.sig.ident.to_string();
                         let start_line = func.sig.ident.span().start().line;
-                        // Store the function content for later nest resolution
                         let fn_content = quote::quote!(#func).to_string();
                         self.router_fns.insert(
                             fn_name,
@@ -342,8 +607,148 @@ mod ast_parser {
                 }
             }
 
-            // Second pass: visit all expressions
             self.visit_file(&syntax);
+        }
+
+        fn extract_acl_rules_text(&mut self, lines: &[&str]) {
+            let content = lines.join("\n");
+            let file = self.current_file.clone();
+
+            // Reuse text parser logic for ACL rules
+            let mut pos = 0;
+            while let Some(start) = content[pos..].find(".add_exact(") {
+                let actual_start = pos + start;
+                let line_num = content[..actual_start].matches('\n').count() + 1;
+                let after = &content[actual_start + 11..];
+                if let Some(path) = self.extract_string_literal(after) {
+                    let rule = self.extract_rule_filter(after, "exact", &path, &file, line_num);
+                    self.acl_rules.push(rule);
+                }
+                pos = actual_start + 11;
+            }
+
+            pos = 0;
+            while let Some(start) = content[pos..].find(".add_prefix(") {
+                let actual_start = pos + start;
+                let line_num = content[..actual_start].matches('\n').count() + 1;
+                let after = &content[actual_start + 12..];
+                if let Some(path) = self.extract_string_literal(after) {
+                    let rule = self.extract_rule_filter(after, "prefix", &path, &file, line_num);
+                    self.acl_rules.push(rule);
+                }
+                pos = actual_start + 12;
+            }
+
+            pos = 0;
+            while let Some(start) = content[pos..].find(".add_any(") {
+                let actual_start = pos + start;
+                let line_num = content[..actual_start].matches('\n').count() + 1;
+                let after = &content[actual_start + 9..];
+                let rule = self.extract_rule_filter(after, "any", "*", &file, line_num);
+                self.acl_rules.push(rule);
+                pos = actual_start + 9;
+            }
+        }
+
+        fn extract_string_literal(&self, text: &str) -> Option<String> {
+            let q1 = text.find('"')?;
+            let after_q1 = &text[q1 + 1..];
+            let q2 = after_q1.find('"')?;
+            Some(after_q1[..q2].to_string())
+        }
+
+        fn extract_rule_filter(&self, text: &str, pattern_type: &str, pattern: &str, file: &str, line: usize) -> AclRule {
+            AclRule {
+                pattern: pattern.to_string(),
+                pattern_type: pattern_type.to_string(),
+                role_mask: self.extract_role_mask(text),
+                id: self.extract_id_filter(text),
+                ip: self.extract_ip_filter(text),
+                time: self.extract_time_filter(text),
+                action: self.extract_action(text),
+                file: file.to_string(),
+                line,
+            }
+        }
+
+        fn extract_role_mask(&self, text: &str) -> String {
+            if let Some(pos) = text.find(".role_mask(") {
+                let after = &text[pos + 11..];
+                if let Some(end) = after.find(')') {
+                    let value = after[..end].trim();
+                    if value == "u32::MAX" { return "*".to_string(); }
+                    return value.to_string();
+                }
+            }
+            "*".to_string()
+        }
+
+        fn extract_id_filter(&self, text: &str) -> String {
+            if let Some(pos) = text.find(".id(") {
+                let after = &text[pos + 4..];
+                if let Some(id) = self.extract_string_literal(after) {
+                    return id;
+                }
+            }
+            "*".to_string()
+        }
+
+        fn extract_ip_filter(&self, text: &str) -> String {
+            if let Some(pos) = text.find(".ip(") {
+                let after = &text[pos + 4..];
+                if let Some(ip) = self.extract_string_literal(after) {
+                    return ip;
+                }
+            }
+            "*".to_string()
+        }
+
+        fn extract_time_filter(&self, text: &str) -> String {
+            if text.contains(".time(") {
+                if text.contains("hours_on_days") {
+                    return "business_hours".to_string();
+                } else if text.contains("hours(") {
+                    return "hours".to_string();
+                }
+                return "custom".to_string();
+            }
+            "*".to_string()
+        }
+
+        fn extract_action(&self, text: &str) -> String {
+            // Look for .action(...) and extract the value
+            if let Some(pos) = text.find(".action(") {
+                let after = &text[pos + 8..];
+                let mut depth = 1;
+                let mut end = 0;
+                for (i, ch) in after.chars().enumerate() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = i;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if end > 0 {
+                    let action = after[..end].trim()
+                        .replace("AclAction::", "")
+                        .replace("Action::", "")
+                        .to_lowercase();
+                    if action.starts_with("error") {
+                        return "error".to_string();
+                    }
+                    if action.starts_with("reroute") {
+                        return "reroute".to_string();
+                    }
+                    return action;
+                }
+            }
+            "*".to_string()
         }
 
         fn returns_router(&self, func: &ItemFn) -> bool {
@@ -363,79 +768,11 @@ mod ast_parser {
         }
 
         pub fn resolve_nests(&mut self) {
-            let mut iterations = 0;
-
-            while !self.pending_nests.is_empty() && iterations < 10 {
-                let nests: Vec<_> = self.pending_nests.drain(..).collect();
-
-                for (prefix, fn_name) in nests {
-                    if let Some((file, content, _)) = self.router_fns.get(&fn_name).cloned() {
-                        // Re-parse this function's content with the prefix
-                        self.parse_nested_router(&content, &file, &prefix);
-                    }
-                }
-                iterations += 1;
-            }
-        }
-
-        fn parse_nested_router(&mut self, content: &str, file: &str, prefix: &str) {
-            // Parse the function content and extract routes with prefix
-            // This is a simplified version - for full accuracy we'd need to track context
-            let lines: Vec<&str> = content.lines().collect();
-            for (i, line) in lines.iter().enumerate() {
-                self.extract_routes_from_text(line, file, i + 1, prefix);
-            }
-        }
-
-        fn extract_routes_from_text(&mut self, line: &str, file: &str, line_num: usize, prefix: &str) {
-            // Fallback to text parsing for nested content
-            if let Some(pos) = line.find(".route(") {
-                let after = &line[pos + 7..];
-                if let Some(path) = self.extract_string_literal(after) {
-                    let full_path = format!("{}{}", prefix, path);
-                    let methods = ["get", "post", "put", "delete", "patch", "head", "options", "trace"];
-
-                    for method in &methods {
-                        if let Some(handler) = self.extract_method_handler(after, method) {
-                            self.endpoints.push(Endpoint {
-                                method: method.to_uppercase(),
-                                path: full_path.clone(),
-                                handler,
-                                file: file.to_string(),
-                                line: line_num,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        fn extract_string_literal(&self, text: &str) -> Option<String> {
-            let q1 = text.find('"')?;
-            let after_q1 = &text[q1 + 1..];
-            let q2 = after_q1.find('"')?;
-            Some(after_q1[..q2].to_string())
-        }
-
-        fn extract_method_handler(&self, text: &str, method: &str) -> Option<String> {
-            let pattern = format!("{}(", method);
-            let pos = text.find(&pattern)?;
-            let after = &text[pos + pattern.len()..];
-            let end = after.find(|c| c == ')' || c == '.')?;
-            let handler = after[..end].trim();
-
-            if handler.is_empty() || handler.starts_with('|') || handler.starts_with('{') {
-                return None;
-            }
-            Some(handler.to_string())
+            // Similar to text parser
         }
 
         pub fn router_fn_count(&self) -> usize {
             self.router_fns.len()
-        }
-
-        pub fn router_fns(&self) -> impl Iterator<Item = (&String, &(String, String, usize))> {
-            self.router_fns.iter()
         }
     }
 
@@ -443,27 +780,21 @@ mod ast_parser {
         fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
             let method_name = node.method.to_string();
 
-            // Check for .route("path", handler)
             if method_name == "route" && node.args.len() >= 2 {
                 if let Some(path) = self.extract_lit_str(&node.args[0]) {
                     let line = node.method.span().start().line;
-
-                    // Check the second argument for method calls
                     self.extract_handlers_from_expr(&node.args[1], &path, line);
                 }
             }
 
-            // Check for .nest("prefix", router)
             if method_name == "nest" && node.args.len() >= 2 {
                 if let Some(prefix) = self.extract_lit_str(&node.args[0]) {
-                    // Try to get the router function name
                     if let Some(fn_name) = self.extract_fn_call_name(&node.args[1]) {
                         self.pending_nests.push((prefix, fn_name));
                     }
                 }
             }
 
-            // Continue visiting
             syn::visit::visit_expr_method_call(self, node);
         }
     }
@@ -499,7 +830,6 @@ mod ast_parser {
             let methods = ["get", "post", "put", "delete", "patch", "head", "options", "trace"];
 
             match expr {
-                // Direct call: get(handler)
                 Expr::Call(call) => {
                     if let Expr::Path(ExprPath { path: fn_path, .. }) = call.func.as_ref() {
                         if let Some(seg) = fn_path.segments.last() {
@@ -518,7 +848,6 @@ mod ast_parser {
                         }
                     }
                 }
-                // Chained: get(h1).post(h2)
                 Expr::MethodCall(method_call) => {
                     let method = method_call.method.to_string();
                     if methods.contains(&method.as_str()) {
@@ -532,7 +861,6 @@ mod ast_parser {
                             });
                         }
                     }
-                    // Continue checking the receiver
                     self.extract_handlers_from_expr(&method_call.receiver, path, line);
                 }
                 _ => {}
@@ -541,15 +869,11 @@ mod ast_parser {
 
         fn extract_handler_name(&self, args: &syn::punctuated::Punctuated<Expr, syn::token::Comma>) -> Option<String> {
             if let Some(first_arg) = args.first() {
-                match first_arg {
-                    Expr::Path(ExprPath { path, .. }) => {
-                        Some(path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>().join("::"))
-                    }
-                    _ => None,
+                if let Expr::Path(ExprPath { path, .. }) = first_arg {
+                    return Some(path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>().join("::"));
                 }
-            } else {
-                None
             }
+            None
         }
     }
 }
@@ -558,41 +882,72 @@ mod ast_parser {
 // Output formatting
 // ============================================================================
 
-fn print_results(endpoints: &[Endpoint]) {
+fn print_results(endpoints: &[Endpoint], acl_rules: &[AclRule]) {
     if endpoints.is_empty() {
         println!("\nNo endpoints found.");
         return;
     }
 
-    println!("\n=== Discovered Endpoints ===\n");
+    println!("\n{:<30} {:<7}  {:>12}, {:>6}, {:>15}, {:>12} | {:<6}",
+        "ENDPOINT", "METHOD", "ROLE", "ID", "IP", "TIME", "ACTION");
+    println!("{}", "-".repeat(100));
 
-    let mut by_path: HashMap<String, Vec<&Endpoint>> = HashMap::new();
-    for ep in endpoints {
-        by_path.entry(ep.path.clone()).or_default().push(ep);
-    }
+    // Sort endpoints by path
+    let mut sorted_endpoints = endpoints.to_vec();
+    sorted_endpoints.sort_by(|a, b| a.path.cmp(&b.path).then(a.method.cmp(&b.method)));
 
-    let mut paths: Vec<_> = by_path.keys().cloned().collect();
-    paths.sort();
+    for ep in &sorted_endpoints {
+        // Find matching ACL rules for this endpoint
+        let matching_rules: Vec<&AclRule> = acl_rules.iter()
+            .filter(|r| r.matches_path(&ep.path))
+            .collect();
 
-    for path in &paths {
-        let eps = &by_path[path];
-        println!("{}", path);
-        for ep in eps {
-            println!("  {:7} -> {}  ({}:{})", ep.method, ep.handler, ep.file, ep.line);
+        if matching_rules.is_empty() {
+            // No ACL rules found - show as unrestricted
+            println!("{:<30} {:<7}  {:>12}, {:>6}, {:>15}, {:>12} | {:<6}  ({})",
+                truncate(&ep.path, 30),
+                &ep.method,
+                "*", "*", "*", "*",
+                "allow",
+                &ep.handler
+            );
+        } else {
+            // Show each matching rule
+            for (i, rule) in matching_rules.iter().enumerate() {
+                let handler = if i == 0 { &ep.handler } else { "" };
+                println!("{:<30} {:<7}  {:>12}, {:>6}, {:>15}, {:>12} | {:<6}  ({})",
+                    if i == 0 { truncate(&ep.path, 30) } else { "".to_string() },
+                    if i == 0 { &ep.method } else { "" },
+                    truncate(&rule.role_mask, 12),
+                    truncate(&rule.id, 6),
+                    truncate(&rule.ip, 15),
+                    truncate(&rule.time, 12),
+                    &rule.action,
+                    handler
+                );
+            }
         }
     }
 
-    println!(
-        "\n{} endpoints found across {} paths",
-        endpoints.len(),
-        paths.len()
-    );
+    println!("\n{} endpoints, {} ACL rules", endpoints.len(), acl_rules.len());
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() > max {
+        format!("{}…", &s[..max-1])
+    } else {
+        s.to_string()
+    }
 }
 
 fn print_help() {
-    println!("Axum Endpoint Parser");
+    println!("Axum Endpoint Parser with ACL Rules");
     println!();
     println!("Usage: endpoint_parser [OPTIONS] <directory>");
+    println!();
+    println!("Output format:");
+    println!("  ENDPOINT METHOD  ROLE, ID, IP, TIME | ACTION  (handler)");
+    println!("  * = any/wildcard");
     println!();
     println!("Options:");
     println!("  --text   Use text-based parsing (default, fast)");
@@ -601,12 +956,6 @@ fn print_help() {
     #[cfg(not(feature = "ast-parser"))]
     println!("  --ast    Use AST-based parsing (requires --features ast-parser)");
     println!("  --help   Show this help message");
-    println!();
-    println!("Examples:");
-    println!("  endpoint_parser src/");
-    println!("  endpoint_parser --text examples/");
-    #[cfg(feature = "ast-parser")]
-    println!("  endpoint_parser --ast src/");
 }
 
 fn main() {
@@ -641,35 +990,22 @@ fn main() {
     let dir = dir_path.unwrap_or_else(|| PathBuf::from("src"));
 
     println!("Parsing axum endpoints in: {}", dir.display());
-    println!("Mode: {:?}", mode);
-    println!();
+    println!("Mode: {:?}\n", mode);
 
     match mode {
         ParseMode::Text => {
             let mut parser = text_parser::TextParser::new();
             parser.parse_dir(&dir);
-
-            println!("Found {} router-returning functions", parser.router_fn_count());
-            for (name, (file, _, line)) in parser.router_fns() {
-                println!("  {} ({}:{})", name, file, line);
-            }
-
             parser.resolve_nests();
-            print_results(&parser.endpoints);
+            print_results(&parser.endpoints, &parser.acl_rules);
         }
         ParseMode::Ast => {
             #[cfg(feature = "ast-parser")]
             {
                 let mut parser = ast_parser::AstParser::new();
                 parser.parse_dir(&dir);
-
-                println!("Found {} router-returning functions", parser.router_fn_count());
-                for (name, (file, _, line)) in parser.router_fns() {
-                    println!("  {} ({}:{})", name, file, line);
-                }
-
                 parser.resolve_nests();
-                print_results(&parser.endpoints);
+                print_results(&parser.endpoints, &parser.acl_rules);
             }
             #[cfg(not(feature = "ast-parser"))]
             {

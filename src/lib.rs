@@ -249,8 +249,12 @@ mod table;
 pub use config::{AclConfig as TomlConfig, ConfigError, ConfigSettings, RuleConfig};
 pub use error::{AccessDenied, AccessDeniedHandler, AclError, DefaultDeniedHandler, JsonDeniedHandler};
 pub use extractor::{
+    // Role extraction
     AnonymousRoleExtractor, ChainedRoleExtractor, ExtensionRoleExtractor, FixedRoleExtractor,
     HeaderRoleExtractor, RoleExtractionResult, RoleExtractor,
+    // ID extraction
+    AnonymousIdExtractor, ExtensionIdExtractor, FixedIdExtractor, HeaderIdExtractor,
+    IdExtractionResult, IdExtractor,
 };
 pub use middleware::{AclConfig, AclLayer, AclMiddleware};
 pub use rule::{AclAction, AclRuleFilter, EndpointPattern, IpMatcher, RequestContext, TimeWindow};
@@ -264,7 +268,10 @@ pub use table::{AclRuleProvider, AclTable, AclTableBuilder, RuleEntry, StaticRul
 pub mod prelude {
     pub use crate::config::ConfigError;
     pub use crate::error::{AccessDenied, AccessDeniedHandler, AclError};
-    pub use crate::extractor::{HeaderRoleExtractor, RoleExtractionResult, RoleExtractor};
+    pub use crate::extractor::{
+        HeaderRoleExtractor, RoleExtractionResult, RoleExtractor,
+        HeaderIdExtractor, IdExtractionResult, IdExtractor,
+    };
     pub use crate::middleware::AclLayer;
     pub use crate::rule::{AclAction, AclRuleFilter, EndpointPattern, IpMatcher, RequestContext, TimeWindow};
     pub use crate::table::{AclRuleProvider, AclTable, RuleEntry};

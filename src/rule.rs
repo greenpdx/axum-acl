@@ -414,6 +414,10 @@ impl IpMatcher {
 }
 
 /// Endpoint pattern for rule matching.
+///
+/// Supports path parameters like `{id}` that match against the user's ID:
+/// - `/api/boat/{id}` matches `/api/boat/boat-123` if user ID is "boat-123"
+/// - `/api/user/{id}/**` matches any path under `/api/user/{user_id}/`
 #[derive(Debug, Clone)]
 pub enum EndpointPattern {
     /// Match any endpoint.
@@ -423,6 +427,7 @@ pub enum EndpointPattern {
     /// Match a path prefix (e.g., `/api/` matches `/api/users`).
     Prefix(String),
     /// Match using a glob pattern (e.g., `/api/*/users`).
+    /// Also supports `{id}` to match against user ID.
     Glob(String),
 }
 
@@ -480,24 +485,48 @@ impl EndpointPattern {
         Self::Exact(s.to_string())
     }
 
-    /// Check if a path matches this pattern.
+    /// Check if a path matches this pattern (without ID context).
     pub fn matches(&self, path: &str) -> bool {
+        self.matches_with_id(path, None)
+    }
+
+    /// Check if a path matches this pattern with optional ID context.
+    ///
+    /// When `user_id` is provided, `{id}` in the pattern is matched against it.
+    /// When `user_id` is None, `{id}` is treated like `*` (matches any segment).
+    ///
+    /// # Example
+    /// ```
+    /// use axum_acl::EndpointPattern;
+    ///
+    /// let pattern = EndpointPattern::glob("/api/boat/{id}/details");
+    ///
+    /// // With matching user ID
+    /// assert!(pattern.matches_with_id("/api/boat/boat-123/details", Some("boat-123")));
+    ///
+    /// // With non-matching user ID
+    /// assert!(!pattern.matches_with_id("/api/boat/boat-456/details", Some("boat-123")));
+    ///
+    /// // Without ID context, {id} matches any segment
+    /// assert!(pattern.matches_with_id("/api/boat/anything/details", None));
+    /// ```
+    pub fn matches_with_id(&self, path: &str, user_id: Option<&str>) -> bool {
         match self {
             Self::Any => true,
             Self::Exact(p) => p == path,
             Self::Prefix(prefix) => path.starts_with(prefix),
-            Self::Glob(pattern) => Self::glob_matches(pattern, path),
+            Self::Glob(pattern) => Self::glob_matches_with_id(pattern, path, user_id),
         }
     }
 
-    fn glob_matches(pattern: &str, path: &str) -> bool {
+    fn glob_matches_with_id(pattern: &str, path: &str, user_id: Option<&str>) -> bool {
         let pattern_parts: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
         let path_parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
-        Self::glob_match_parts(&pattern_parts, &path_parts)
+        Self::glob_match_parts_with_id(&pattern_parts, &path_parts, user_id)
     }
 
-    fn glob_match_parts(pattern: &[&str], path: &[&str]) -> bool {
+    fn glob_match_parts_with_id(pattern: &[&str], path: &[&str], user_id: Option<&str>) -> bool {
         if pattern.is_empty() {
             return path.is_empty();
         }
@@ -511,7 +540,7 @@ impl EndpointPattern {
             }
             // Try matching ** against 0, 1, 2, ... path segments
             for i in 0..=path.len() {
-                if Self::glob_match_parts(rest_pattern, &path[i..]) {
+                if Self::glob_match_parts_with_id(rest_pattern, &path[i..], user_id) {
                     return true;
                 }
             }
@@ -520,9 +549,77 @@ impl EndpointPattern {
             false
         } else {
             let (first_path, rest_path) = (path[0], &path[1..]);
-            let segment_matches = first_pattern == "*" || first_pattern == first_path;
-            segment_matches && Self::glob_match_parts(rest_pattern, rest_path)
+
+            // Check if this is an {id} parameter
+            let segment_matches = if first_pattern == "{id}" {
+                // Match against user ID if provided, otherwise treat as wildcard
+                match user_id {
+                    Some(id) => first_path == id,
+                    None => true, // No ID context, treat as wildcard
+                }
+            } else if first_pattern.starts_with('{') && first_pattern.ends_with('}') {
+                // Other path parameters like {user_id}, {boat_id} - treat as wildcards
+                true
+            } else {
+                first_pattern == "*" || first_pattern == first_path
+            };
+
+            segment_matches && Self::glob_match_parts_with_id(rest_pattern, rest_path, user_id)
         }
+    }
+
+    /// Extract the value of `{id}` from a path given this pattern.
+    ///
+    /// Returns None if the pattern doesn't contain `{id}` or the path doesn't match.
+    ///
+    /// # Example
+    /// ```
+    /// use axum_acl::EndpointPattern;
+    ///
+    /// let pattern = EndpointPattern::glob("/api/boat/{id}/details");
+    /// assert_eq!(pattern.extract_id("/api/boat/boat-123/details"), Some("boat-123".to_string()));
+    /// assert_eq!(pattern.extract_id("/api/boat/xyz/details"), Some("xyz".to_string()));
+    /// assert_eq!(pattern.extract_id("/api/wrong/path"), None);
+    /// ```
+    pub fn extract_id(&self, path: &str) -> Option<String> {
+        match self {
+            Self::Glob(pattern) => Self::extract_id_from_glob(pattern, path),
+            _ => None,
+        }
+    }
+
+    fn extract_id_from_glob(pattern: &str, path: &str) -> Option<String> {
+        let pattern_parts: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+        let path_parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+        Self::extract_id_from_parts(&pattern_parts, &path_parts)
+    }
+
+    fn extract_id_from_parts(pattern: &[&str], path: &[&str]) -> Option<String> {
+        if pattern.is_empty() || path.is_empty() {
+            return None;
+        }
+
+        for (i, &p) in pattern.iter().enumerate() {
+            if p == "{id}" {
+                if i < path.len() {
+                    return Some(path[i].to_string());
+                }
+                return None;
+            }
+            if p == "**" {
+                // Can't reliably extract after **
+                continue;
+            }
+            if i >= path.len() {
+                return None;
+            }
+            // Check if pattern segment matches (for non-{id} segments)
+            if p != "*" && p != path[i] && !p.starts_with('{') {
+                return None;
+            }
+        }
+        None
     }
 }
 
@@ -572,6 +669,39 @@ mod tests {
         let pattern = EndpointPattern::glob("/api/**");
         assert!(pattern.matches("/api/users"));
         assert!(pattern.matches("/api/v1/users/1"));
+    }
+
+    #[test]
+    fn test_endpoint_glob_with_id() {
+        let pattern = EndpointPattern::glob("/api/boat/{id}/details");
+
+        // Without ID context, {id} matches any segment
+        assert!(pattern.matches("/api/boat/boat-123/details"));
+        assert!(pattern.matches("/api/boat/anything/details"));
+
+        // With matching user ID
+        assert!(pattern.matches_with_id("/api/boat/boat-123/details", Some("boat-123")));
+
+        // With non-matching user ID
+        assert!(!pattern.matches_with_id("/api/boat/boat-456/details", Some("boat-123")));
+
+        // More complex pattern
+        let pattern = EndpointPattern::glob("/api/user/{id}/**");
+        assert!(pattern.matches_with_id("/api/user/user-1/profile", Some("user-1")));
+        assert!(pattern.matches_with_id("/api/user/user-1/boats/123", Some("user-1")));
+        assert!(!pattern.matches_with_id("/api/user/user-2/profile", Some("user-1")));
+    }
+
+    #[test]
+    fn test_extract_id_from_path() {
+        let pattern = EndpointPattern::glob("/api/boat/{id}/details");
+        assert_eq!(pattern.extract_id("/api/boat/boat-123/details"), Some("boat-123".to_string()));
+        assert_eq!(pattern.extract_id("/api/boat/xyz/details"), Some("xyz".to_string()));
+        assert_eq!(pattern.extract_id("/api/wrong/path"), None);
+
+        let pattern = EndpointPattern::glob("/users/{id}");
+        assert_eq!(pattern.extract_id("/users/123"), Some("123".to_string()));
+        assert_eq!(pattern.extract_id("/users/"), None);
     }
 
     #[test]
