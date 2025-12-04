@@ -4,11 +4,12 @@ Flexible Access Control List (ACL) middleware for [axum](https://docs.rs/axum) 0
 
 ## Features
 
-- **TOML Configuration** - Define rules in config files (compile-time or runtime)
-- **Table-based rules** - No hardcoded rules; all access control is configured at runtime
-- **Four-tuple matching** - Rules match on Role + Endpoint + Time + IP
+- **TOML Configuration** - Define rules in config files (compile-time or startup)
+- **Table-based rules** - No hardcoded rules; all access control is configured at startup
+- **Five-tuple matching** - Rules match on Endpoint + Role + ID + IP + Time
 - **Extended actions** - Allow, Deny, Error (custom codes), Reroute, Log
-- **Flexible role extraction** - Extract roles from headers, extensions, or custom sources
+- **Flexible extractors** - Extract roles (u32 bitmask) and IDs from headers, extensions, or custom sources
+- **Path parameters** - Match `{id}` in paths against user ID for ownership-based access
 - **Pattern matching** - Exact, prefix, and glob patterns for endpoints
 - **Time windows** - Restrict access to specific hours or days
 - **IP filtering** - Single IPs, CIDR ranges, or lists
@@ -29,8 +30,12 @@ tokio = { version = "1", features = ["full"] }
 
 ```rust
 use axum::{Router, routing::get};
-use axum_acl::{AclLayer, AclTable, AclRule, AclAction, EndpointPattern};
+use axum_acl::{AclLayer, AclTable, AclRuleFilter, AclAction};
 use std::net::SocketAddr;
+
+// Define role bits
+const ROLE_ADMIN: u32 = 0b001;
+const ROLE_USER: u32 = 0b010;
 
 #[tokio::main]
 async fn main() {
@@ -38,23 +43,17 @@ async fn main() {
     let acl_table = AclTable::builder()
         .default_action(AclAction::Deny)
         // Admins can access everything
-        .add_rule(
-            AclRule::new("admin")
-                .endpoint(EndpointPattern::any())
-                .action(AclAction::Allow)
-        )
+        .add_any(AclRuleFilter::new()
+            .role_mask(ROLE_ADMIN)
+            .action(AclAction::Allow))
         // Users can access /api/**
-        .add_rule(
-            AclRule::new("user")
-                .endpoint(EndpointPattern::prefix("/api/"))
-                .action(AclAction::Allow)
-        )
-        // Public endpoints
-        .add_rule(
-            AclRule::any_role()
-                .endpoint(EndpointPattern::prefix("/public/"))
-                .action(AclAction::Allow)
-        )
+        .add_prefix("/api/", AclRuleFilter::new()
+            .role_mask(ROLE_USER)
+            .action(AclAction::Allow))
+        // Public endpoints (any role)
+        .add_prefix("/public/", AclRuleFilter::new()
+            .role_mask(u32::MAX)
+            .action(AclAction::Allow))
         .build();
 
     let app = Router::new()
@@ -78,19 +77,19 @@ Test it:
 # Public endpoint (allowed)
 curl http://localhost:3000/public/info
 
-# API as user (allowed)
-curl -H "X-Role: user" http://localhost:3000/api/users
+# API as user (role_mask=2, allowed)
+curl -H "X-Roles: 2" http://localhost:3000/api/users
 
 # Admin as user (denied)
-curl -H "X-Role: user" http://localhost:3000/admin/dashboard
+curl -H "X-Roles: 2" http://localhost:3000/admin/dashboard
 
-# Admin as admin (allowed)
-curl -H "X-Role: admin" http://localhost:3000/admin/dashboard
+# Admin as admin (role_mask=1, allowed)
+curl -H "X-Roles: 1" http://localhost:3000/admin/dashboard
 ```
 
 ## TOML Configuration
 
-Define rules in TOML format - either embedded at compile-time or loaded from a file at runtime.
+Define rules in TOML format - either embedded at compile-time or loaded from a file at startup.
 
 ### Compile-time Embedded Config
 
@@ -105,7 +104,7 @@ fn main() {
 }
 ```
 
-### Runtime File Loading
+### Startup File Loading
 
 ```rust
 use axum_acl::AclTable;
@@ -123,41 +122,42 @@ default_action = "deny"
 
 # Rules are sorted by priority (lower = higher priority)
 [[rules]]
-role = "admin"
 endpoint = "*"
+role_mask = 1              # Admin role bit
 action = "allow"
 priority = 10
 description = "Admins have full access"
 
 [[rules]]
-role = "user"
 endpoint = "/api/**"
+role_mask = 2              # User role bit
 time = { start = 9, end = 17, days = [0,1,2,3,4] }  # Mon-Fri 9-5 UTC
 action = "allow"
 priority = 100
 
 [[rules]]
-role = "*"
 endpoint = "/admin/**"
+role_mask = "*"            # Any role
 action = { type = "error", code = 403, message = "Admin access required" }
 priority = 20
 
 [[rules]]
-role = "anonymous"
-endpoint = "/dashboard/**"
-action = { type = "reroute", target = "/login", preserve_path = true }
-priority = 30
+endpoint = "/boat/{id}/**"
+role_mask = 2
+id = "{id}"                # Match path {id} against user ID
+action = "allow"
+priority = 50
 
 [[rules]]
-role = "*"
 endpoint = "/internal/**"
+role_mask = "*"
 ip = "127.0.0.1"
 action = "allow"
 priority = 50
 
 [[rules]]
-role = "*"
 endpoint = "/public/**"
+role_mask = "*"
 action = "allow"
 priority = 200
 ```
@@ -172,19 +172,30 @@ priority = 200
 | Reroute | `{ type = "reroute", target = "/path" }` | Redirect to another path |
 | Log | `{ type = "log", level = "warn", message = "..." }` | Log and allow |
 
-## Rule Structure
+## Rule Structure (5-Tuple)
 
-Each rule is a tuple of:
+Each rule matches on five dimensions:
 
 | Field | Description | Default |
 |-------|-------------|---------|
-| `role` | Role name or `*` for any | Required |
 | `endpoint` | Path pattern to match | Any |
-| `time` | Time window when rule is active | Any time |
+| `role_mask` | u32 bitmask or `*` for any | Required |
+| `id` | User ID match: exact, `*`, or `{id}` for path param | `*` (any) |
 | `ip` | Client IP(s) to match | Any IP |
-| `action` | Allow or Deny | Allow |
+| `time` | Time window when rule is active | Any time |
+| `action` | Allow, Deny, Error, Reroute | Allow |
 
-Rules are evaluated **in order**. The first matching rule wins.
+Rules are evaluated in order. The first matching rule wins.
+
+### Matching Logic
+
+```
+endpoint: HashMap lookup (O(1) for exact) or pattern match
+role:     (rule.role_mask & request.roles) != 0
+id:       rule.id == "*" OR rule.id == request.id OR rule.id == "{id}" (path param)
+ip:       CIDR match (ip & mask == network)
+time:     start <= now <= end AND day in days
+```
 
 ## Endpoint Patterns
 
@@ -204,11 +215,135 @@ EndpointPattern::prefix("/api/")            // /api/*, /api/users, etc.
 EndpointPattern::glob("/api/*/users")       // /api/v1/users, /api/v2/users
 EndpointPattern::glob("/api/**/export")     // /api/export, /api/v1/data/export
 
+// Path parameters (matched against user ID)
+EndpointPattern::glob("/boat/{id}/details") // {id} matches user's ID
+
 // Parse from string
 EndpointPattern::parse("/api/")             // Prefix (ends with /)
 EndpointPattern::parse("/api/users")        // Exact
 EndpointPattern::parse("/api/**")           // Glob
 EndpointPattern::parse("*")                 // Any
+```
+
+## Role Extraction
+
+Roles are extracted as a `u32` bitmask, allowing up to 32 roles per user.
+
+### Default: Header as Bitmask
+
+```rust
+// X-Roles header parsed as decimal or hex
+// X-Roles: 5      -> 0b101 (roles 0 and 2)
+// X-Roles: 0x1F   -> 0b11111 (roles 0-4)
+```
+
+### Custom Header
+
+```rust
+use axum_acl::{AclLayer, AclTable, HeaderRoleExtractor};
+
+let layer = AclLayer::new(acl_table)
+    .with_extractor(HeaderRoleExtractor::new("X-User-Roles"));
+```
+
+### With Default Roles for Anonymous Users
+
+```rust
+use axum_acl::HeaderRoleExtractor;
+
+const ROLE_GUEST: u32 = 0b100;
+
+let extractor = HeaderRoleExtractor::new("X-Roles")
+    .with_default_roles(ROLE_GUEST);
+```
+
+### Custom Role Translation
+
+Translate your role scheme (strings, enums, etc.) to u32 bitmask:
+
+```rust
+use axum_acl::{RoleExtractor, RoleExtractionResult};
+use http::Request;
+
+// Your role definitions
+const ROLE_ADMIN: u32 = 1 << 0;
+const ROLE_USER: u32 = 1 << 1;
+const ROLE_GUEST: u32 = 1 << 2;
+
+struct JwtRoleExtractor;
+
+impl<B> RoleExtractor<B> for JwtRoleExtractor {
+    fn extract_roles(&self, request: &Request<B>) -> RoleExtractionResult {
+        // Decode JWT, lookup database, etc.
+        if let Some(auth) = request.headers().get("Authorization") {
+            // Parse and translate to bitmask
+            let roles = ROLE_USER | ROLE_GUEST;
+            return RoleExtractionResult::Roles(roles);
+        }
+        RoleExtractionResult::Anonymous
+    }
+}
+
+let layer = AclLayer::new(acl_table)
+    .with_extractor(JwtRoleExtractor);
+```
+
+## ID Extraction
+
+User IDs are extracted as strings for matching against `{id}` path parameters.
+
+### Header-based ID
+
+```rust
+use axum_acl::HeaderIdExtractor;
+
+let layer = AclLayer::new(acl_table)
+    .with_id_extractor(HeaderIdExtractor::new("X-User-Id"));
+```
+
+### Custom ID Extraction
+
+```rust
+use axum_acl::{IdExtractor, IdExtractionResult};
+use http::Request;
+
+struct JwtIdExtractor;
+
+impl<B> IdExtractor<B> for JwtIdExtractor {
+    fn extract_id(&self, request: &Request<B>) -> IdExtractionResult {
+        // Extract user ID from JWT, session, etc.
+        if let Some(auth) = request.headers().get("Authorization") {
+            return IdExtractionResult::Id("user-123".to_string());
+        }
+        IdExtractionResult::Anonymous
+    }
+}
+```
+
+### Path Parameter Matching
+
+Match `{id}` in paths against the user's ID for ownership-based access:
+
+```rust
+use axum_acl::{AclTable, AclRuleFilter, AclAction, EndpointPattern};
+
+const ROLE_USER: u32 = 0b010;
+
+let table = AclTable::builder()
+    .default_action(AclAction::Deny)
+    // Users can only access their own boat data
+    .add_pattern(
+        EndpointPattern::glob("/api/boat/{id}/**"),
+        AclRuleFilter::new()
+            .role_mask(ROLE_USER)
+            .id("{id}")  // Path {id} must match user's ID
+            .action(AclAction::Allow)
+    )
+    .build();
+
+// User with id="boat-123":
+//   /api/boat/boat-123/details -> ALLOWED
+//   /api/boat/boat-456/details -> DENIED
 ```
 
 ## Time Windows
@@ -249,128 +384,6 @@ IpMatcher::parse("192.168.1.1").unwrap()    // Single
 IpMatcher::parse("192.168.0.0/16").unwrap() // CIDR
 ```
 
-## Role Extraction
-
-By default, roles are extracted from the `X-Role` header.
-
-### Using a Different Header
-
-```rust
-use axum_acl::{AclLayer, AclTable, HeaderRoleExtractor};
-
-let layer = AclLayer::new(acl_table)
-    .with_extractor(HeaderRoleExtractor::new("X-User-Role"));
-```
-
-### With Default Role for Missing Header
-
-```rust
-use axum_acl::HeaderRoleExtractor;
-
-let extractor = HeaderRoleExtractor::new("X-Role")
-    .with_default_role("guest");
-```
-
-### From Request Extensions
-
-When using authentication middleware that sets user info:
-
-```rust
-use axum_acl::{RoleExtractor, RoleExtractionResult};
-
-#[derive(Clone)]
-struct User {
-    role: String,
-}
-
-struct UserRoleExtractor;
-
-impl<B> RoleExtractor<B> for UserRoleExtractor {
-    fn extract_role(&self, request: &http::Request<B>) -> RoleExtractionResult {
-        match request.extensions().get::<User>() {
-            Some(user) => RoleExtractionResult::Role(user.role.clone()),
-            None => RoleExtractionResult::Anonymous,
-        }
-    }
-}
-
-// Use it
-let layer = AclLayer::new(acl_table)
-    .with_extractor(UserRoleExtractor);
-```
-
-## Complete Example with All Features
-
-```rust
-use axum::{Router, routing::get};
-use axum_acl::{
-    AclLayer, AclTable, AclRule, AclAction,
-    EndpointPattern, TimeWindow, IpMatcher,
-    JsonDeniedHandler,
-};
-use std::net::SocketAddr;
-
-#[tokio::main]
-async fn main() {
-    let acl_table = AclTable::builder()
-        .default_action(AclAction::Deny)
-
-        // Admins: full access
-        .add_rule(
-            AclRule::new("admin")
-                .endpoint(EndpointPattern::any())
-                .action(AclAction::Allow)
-                .description("Admin full access")
-        )
-
-        // Internal endpoints: localhost only
-        .add_rule(
-            AclRule::any_role()
-                .endpoint(EndpointPattern::prefix("/internal/"))
-                .ip(IpMatcher::parse("127.0.0.1").unwrap())
-                .action(AclAction::Allow)
-                .description("Internal - localhost only")
-        )
-
-        // Users: API access during business hours
-        .add_rule(
-            AclRule::new("user")
-                .endpoint(EndpointPattern::prefix("/api/"))
-                .time(TimeWindow::hours_on_days(9, 17, vec![0,1,2,3,4]))
-                .action(AclAction::Allow)
-                .description("User API access - business hours")
-        )
-
-        // Public endpoints
-        .add_rule(
-            AclRule::any_role()
-                .endpoint(EndpointPattern::prefix("/public/"))
-                .action(AclAction::Allow)
-                .description("Public access")
-        )
-
-        .build();
-
-    let app = Router::new()
-        .route("/public/health", get(|| async { "OK" }))
-        .route("/api/data", get(|| async { "Data" }))
-        .route("/internal/metrics", get(|| async { "Metrics" }))
-        .route("/admin/config", get(|| async { "Config" }))
-        .layer(
-            AclLayer::new(acl_table)
-                .with_denied_handler(JsonDeniedHandler::new())
-                .with_anonymous_role("guest")
-                .with_forwarded_ip_header("X-Forwarded-For")
-        );
-
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>()
-    ).await.unwrap();
-}
-```
-
 ## Behind a Reverse Proxy
 
 When behind nginx, traefik, or similar:
@@ -391,10 +404,6 @@ use http::StatusCode;
 let layer = AclLayer::new(acl_table)
     .with_denied_handler(JsonDeniedHandler::new());
 
-// Or with details (careful in production!)
-let layer = AclLayer::new(acl_table)
-    .with_denied_handler(JsonDeniedHandler::new().with_details());
-
 // Or custom handler
 struct MyHandler;
 
@@ -402,7 +411,7 @@ impl AccessDeniedHandler for MyHandler {
     fn handle(&self, denied: &AccessDenied) -> Response {
         (
             StatusCode::FORBIDDEN,
-            format!("Access denied for {}", denied.role)
+            format!("Access denied: roles={}", denied.roles)
         ).into_response()
     }
 }
@@ -411,28 +420,79 @@ impl AccessDeniedHandler for MyHandler {
 ## Dynamic Rules from Database
 
 ```rust
-use axum_acl::{AclRuleProvider, AclRule, AclTable, AclAction};
+use axum_acl::{AclRuleProvider, RuleEntry, AclRuleFilter, AclTable, AclAction, EndpointPattern};
 
 struct DbRuleProvider { /* db pool */ }
 
 impl AclRuleProvider for DbRuleProvider {
     type Error = std::io::Error;
 
-    fn load_rules(&self) -> Result<Vec<AclRule>, Self::Error> {
+    fn load_rules(&self) -> Result<Vec<RuleEntry>, Self::Error> {
         // Query your database
-        // SELECT role, endpoint, time_start, time_end, ip_pattern, action FROM acl_rules
-        Ok(vec![])
+        Ok(vec![
+            RuleEntry::any(AclRuleFilter::new()
+                .role_mask(0b001)
+                .action(AclAction::Allow))
+        ])
     }
 }
 
-// Usage
+// Usage at startup
 fn build_table(provider: &DbRuleProvider) -> AclTable {
     let rules = provider.load_rules().unwrap();
-    AclTable::builder()
-        .default_action(AclAction::Deny)
-        .add_rules(rules)
-        .build()
+    let mut builder = AclTable::builder().default_action(AclAction::Deny);
+    for entry in rules {
+        builder = builder.add_pattern(entry.pattern, entry.filter);
+    }
+    builder.build()
 }
+```
+
+## Endpoint Parser Tool
+
+Discover endpoints and their ACL rules from your codebase:
+
+```bash
+# Build the parser
+cargo build --bin endpoint_parser
+
+# Parse endpoints (table format)
+cargo run --bin endpoint_parser -- examples/
+
+# Output as CSV
+cargo run --bin endpoint_parser -- --csv examples/ > endpoints.csv
+
+# Output as TOML config
+cargo run --bin endpoint_parser -- --toml examples/ > acl.toml
+
+# Use AST-based parsing (more accurate, requires feature)
+cargo run --bin endpoint_parser --features ast-parser -- --ast examples/
+```
+
+### CLI Arguments
+
+```
+Usage: endpoint_parser [OPTIONS] <directory>
+
+Options:
+  --text    Use text-based parsing (default, fast)
+  --ast     Use AST-based parsing (requires --features ast-parser)
+
+  --table   Output as formatted table (default)
+  --csv     Output as CSV
+  --toml    Output as TOML config file
+
+  --help    Show help message
+```
+
+### Output Format
+
+```
+ENDPOINT                       METHOD         ROLE,   ID,           IP,     TIME | ACTION  HANDLER              LOCATION
+------------------------------------------------------------------------------------------------------------------------
+/admin/dashboard               GET      ROLE_ADMIN,    *,            *,        * | allow   admin_dashboard      basic.rs:109
+/api/users                     GET       ROLE_USER,    *,            *,        * | allow   api_users            basic.rs:106
+/public/info                   GET               *,    *,            *,        * | allow   public_info          basic.rs:103
 ```
 
 ## API Reference
@@ -441,10 +501,11 @@ fn build_table(provider: &DbRuleProvider) -> AclTable {
 
 | Type | Description |
 |------|-------------|
-| `AclTable` | Container for ACL rules |
-| `AclRule` | A single access control rule |
-| `AclAction` | Allow or Deny |
-| `EndpointPattern` | Path matching pattern |
+| `AclTable` | Container for ACL rules (HashMap + patterns) |
+| `AclRuleFilter` | Filter for 5-tuple matching (role, id, ip, time, action) |
+| `AclAction` | Allow, Deny, Error, Reroute, Log |
+| `EndpointPattern` | Path matching: Exact, Prefix, Glob, Any |
+| `RequestContext` | Request metadata: roles (u32), ip, id |
 | `TimeWindow` | Time-based restriction |
 | `IpMatcher` | IP address matching |
 
@@ -460,11 +521,20 @@ fn build_table(provider: &DbRuleProvider) -> AclTable {
 
 | Type | Description |
 |------|-------------|
-| `RoleExtractor` | Trait for extracting roles |
+| `RoleExtractor` | Trait for extracting roles (u32 bitmask) |
 | `HeaderRoleExtractor` | Extract from HTTP header |
 | `ExtensionRoleExtractor` | Extract from request extension |
-| `FixedRoleExtractor` | Always returns same role |
+| `FixedRoleExtractor` | Always returns same roles |
 | `ChainedRoleExtractor` | Try multiple extractors |
+
+### ID Extraction
+
+| Type | Description |
+|------|-------------|
+| `IdExtractor` | Trait for extracting user ID (String) |
+| `HeaderIdExtractor` | Extract from HTTP header |
+| `ExtensionIdExtractor` | Extract from request extension |
+| `FixedIdExtractor` | Always returns same ID |
 
 ### Error Handling
 
@@ -486,7 +556,7 @@ cargo run --example basic
 # Custom role extraction from request extensions
 cargo run --example custom_extractor
 
-# TOML configuration (compile-time and runtime)
+# TOML configuration (compile-time and startup)
 cargo run --example toml_config
 ```
 

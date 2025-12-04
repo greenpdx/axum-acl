@@ -1,0 +1,139 @@
+# ACL Configuration Example
+# This file demonstrates all available options for axum-acl rules
+
+[settings]
+# Default action when no rules match: "allow" or "deny"
+default_action = "deny"
+
+# Rule priority: lower number = higher priority (checked first)
+# Rules are evaluated in priority order; first match wins
+
+# ============================================================================
+# ADMIN RULES (highest priority)
+# ============================================================================
+
+[[rules]]
+role = "admin"
+endpoint = "*"                    # Match all endpoints
+action = "allow"
+priority = 10
+description = "Admins have full access to everything"
+
+# ============================================================================
+# BLOCKED/ERROR RESPONSES
+# ============================================================================
+
+[[rules]]
+role = "*"                        # Any role (including anonymous)
+endpoint = "/admin/**"            # Glob pattern: /admin/anything/here
+action = { type = "error", code = 403, message = "Admin access required" }
+priority = 20
+description = "Block non-admin access to admin routes"
+
+[[rules]]
+role = "banned"
+endpoint = "*"
+action = { type = "error", code = 403, message = "Your account has been suspended" }
+priority = 5                      # High priority - check early
+description = "Banned users are blocked everywhere"
+
+# ============================================================================
+# REDIRECTS/REROUTES
+# ============================================================================
+
+[[rules]]
+role = "*"
+endpoint = "/old-api/**"
+action = { type = "reroute", target = "/api/v2", preserve_path = false }
+priority = 50
+description = "Redirect old API to new version"
+
+[[rules]]
+role = "anonymous"
+endpoint = "/dashboard/**"
+action = { type = "reroute", target = "/login", preserve_path = true }
+priority = 40
+description = "Redirect anonymous users to login"
+
+# ============================================================================
+# TIME-BASED ACCESS
+# ============================================================================
+
+[[rules]]
+role = "user"
+endpoint = "/api/**"
+time = { start = 9, end = 17, days = [0, 1, 2, 3, 4] }  # Mon-Fri 9-5 UTC
+action = "allow"
+priority = 100
+description = "Users can access API during business hours"
+
+[[rules]]
+role = "user"
+endpoint = "/api/**"
+action = { type = "error", code = 503, message = "API is only available during business hours (9-17 UTC, Mon-Fri)" }
+priority = 101                    # Lower priority than the allow rule
+description = "Block API access outside business hours"
+
+# ============================================================================
+# IP-BASED RESTRICTIONS
+# ============================================================================
+
+[[rules]]
+role = "*"
+endpoint = "/internal/**"
+ip = "127.0.0.1"                  # Localhost only
+action = "allow"
+priority = 30
+description = "Internal endpoints - localhost only"
+
+[[rules]]
+role = "*"
+endpoint = "/internal/**"
+ip = "10.0.0.0/8"                 # Private network
+action = "allow"
+priority = 31
+description = "Internal endpoints - private network"
+
+[[rules]]
+role = "*"
+endpoint = "/internal/**"
+action = { type = "error", code = 403, message = "Internal access only" }
+priority = 32
+description = "Block external access to internal endpoints"
+
+# ============================================================================
+# LOGGING/MONITORING
+# ============================================================================
+
+[[rules]]
+role = "*"
+endpoint = "/api/sensitive/**"
+action = { type = "log", level = "warn", message = "Sensitive endpoint accessed" }
+priority = 60
+description = "Log access to sensitive endpoints (but allow)"
+
+# ============================================================================
+# PUBLIC ENDPOINTS
+# ============================================================================
+
+[[rules]]
+role = "*"
+endpoint = "/public/**"
+action = "allow"
+priority = 200
+description = "Public endpoints - no auth required"
+
+[[rules]]
+role = "*"
+endpoint = "/health"
+action = "allow"
+priority = 200
+description = "Health check endpoint"
+
+[[rules]]
+role = "*"
+endpoint = "/metrics"
+ip = "10.0.0.0/8"
+action = "allow"
+priority = 200
+description = "Metrics endpoint - internal network only"
