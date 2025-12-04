@@ -557,7 +557,7 @@ impl<B> ChainedRoleExtractor<B> {
     }
 
     /// Add an extractor to the chain.
-    pub fn add<E: RoleExtractor<B> + 'static>(mut self, extractor: E) -> Self {
+    pub fn push<E: RoleExtractor<B> + 'static>(mut self, extractor: E) -> Self {
         self.extractors.push(Box::new(extractor));
         self
     }

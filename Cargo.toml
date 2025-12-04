@@ -1,13 +1,20 @@
 [package]
 name = "axum-acl"
 version = "0.1.0"
-edition = "2021"
-description = "Flexible ACL middleware for axum 0.8 with role-endpoint-time-ip rule matching"
+edition = "2024"
+rust-version = "1.85"
+description = "Flexible ACL middleware for axum 0.8 with 5-tuple rule matching (endpoint, role, id, ip, time)"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/yourusername/axum-acl"
+repository = "https://github.com/greenpdx/axum-acl"
+homepage = "https://github.com/greenpdx/axum-acl"
+documentation = "https://docs.rs/axum-acl"
 keywords = ["axum", "middleware", "acl", "authorization", "access-control"]
 categories = ["web-programming", "authentication"]
 readme = "README.md"
+authors = ["Shaun Savage <savages@crmep.com>"]
+exclude = [
+    ".github/*",
+]
 
 [dependencies]
 axum = "0.8"

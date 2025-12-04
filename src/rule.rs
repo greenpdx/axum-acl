@@ -222,7 +222,7 @@ impl Default for AclRuleFilter {
 ///
 /// Defines a time range during which a rule is active.
 /// Times are evaluated in UTC.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TimeWindow {
     /// Start time (inclusive). None means from midnight.
     pub start: Option<NaiveTime>,
@@ -231,16 +231,6 @@ pub struct TimeWindow {
     /// Days of the week when this window is active (0 = Monday, 6 = Sunday).
     /// Empty means all days.
     pub days: Vec<u32>,
-}
-
-impl Default for TimeWindow {
-    fn default() -> Self {
-        Self {
-            start: None,
-            end: None,
-            days: Vec::new(),
-        }
-    }
 }
 
 impl TimeWindow {
@@ -318,9 +308,10 @@ impl TimeWindow {
 }
 
 /// IP address specification for rule matching.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum IpMatcher {
     /// Match any IP address.
+    #[default]
     Any,
     /// Match a single IP address.
     Single(IpAddr),
@@ -328,12 +319,6 @@ pub enum IpMatcher {
     Network(IpNetwork),
     /// Match multiple IP addresses or networks.
     List(Vec<IpMatcher>),
-}
-
-impl Default for IpMatcher {
-    fn default() -> Self {
-        Self::Any
-    }
 }
 
 impl IpMatcher {
@@ -418,9 +403,10 @@ impl IpMatcher {
 /// Supports path parameters like `{id}` that match against the user's ID:
 /// - `/api/boat/{id}` matches `/api/boat/boat-123` if user ID is "boat-123"
 /// - `/api/user/{id}/**` matches any path under `/api/user/{user_id}/`
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum EndpointPattern {
     /// Match any endpoint.
+    #[default]
     Any,
     /// Match an exact path.
     Exact(String),
@@ -429,12 +415,6 @@ pub enum EndpointPattern {
     /// Match using a glob pattern (e.g., `/api/*/users`).
     /// Also supports `{id}` to match against user ID.
     Glob(String),
-}
-
-impl Default for EndpointPattern {
-    fn default() -> Self {
-        Self::Any
-    }
 }
 
 impl EndpointPattern {

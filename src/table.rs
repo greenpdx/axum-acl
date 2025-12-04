@@ -194,7 +194,7 @@ impl AclTableBuilder {
         let endpoint = endpoint.into();
         self.exact_rules
             .entry(endpoint)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(filter);
         self
     }
@@ -208,7 +208,7 @@ impl AclTableBuilder {
         let endpoint = endpoint.into();
         self.exact_rules
             .entry(endpoint)
-            .or_insert_with(Vec::new)
+            .or_default()
             .extend(filters);
         self
     }
