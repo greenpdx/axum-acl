@@ -81,6 +81,14 @@ enum ParseMode {
     Ast,
 }
 
+/// Output format
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OutputFormat {
+    Table,
+    Csv,
+    Toml,
+}
+
 // ============================================================================
 // Text-based Parser
 // ============================================================================
@@ -882,54 +890,181 @@ mod ast_parser {
 // Output formatting
 // ============================================================================
 
-fn print_results(endpoints: &[Endpoint], acl_rules: &[AclRule]) {
+fn print_results(endpoints: &[Endpoint], acl_rules: &[AclRule], format: OutputFormat) {
     if endpoints.is_empty() {
         println!("\nNo endpoints found.");
         return;
     }
 
-    println!("\n{:<30} {:<7}  {:>12}, {:>6}, {:>15}, {:>12} | {:<6}",
-        "ENDPOINT", "METHOD", "ROLE", "ID", "IP", "TIME", "ACTION");
-    println!("{}", "-".repeat(100));
+    match format {
+        OutputFormat::Table => print_table(endpoints, acl_rules),
+        OutputFormat::Csv => print_csv(endpoints, acl_rules),
+        OutputFormat::Toml => print_toml(endpoints, acl_rules),
+    }
+}
 
-    // Sort endpoints by path
+fn print_table(endpoints: &[Endpoint], acl_rules: &[AclRule]) {
+    println!("\n{:<30} {:<7}  {:>10}, {:>4}, {:>12}, {:>8} | {:<6}  {:<20} {}",
+        "ENDPOINT", "METHOD", "ROLE", "ID", "IP", "TIME", "ACTION", "HANDLER", "LOCATION");
+    println!("{}", "-".repeat(120));
+
     let mut sorted_endpoints = endpoints.to_vec();
     sorted_endpoints.sort_by(|a, b| a.path.cmp(&b.path).then(a.method.cmp(&b.method)));
 
     for ep in &sorted_endpoints {
-        // Find matching ACL rules for this endpoint
         let matching_rules: Vec<&AclRule> = acl_rules.iter()
             .filter(|r| r.matches_path(&ep.path))
             .collect();
 
+        let location = format!("{}:{}", short_path(&ep.file), ep.line);
+
         if matching_rules.is_empty() {
-            // No ACL rules found - show as unrestricted
-            println!("{:<30} {:<7}  {:>12}, {:>6}, {:>15}, {:>12} | {:<6}  ({})",
+            println!("{:<30} {:<7}  {:>10}, {:>4}, {:>12}, {:>8} | {:<6}  {:<20} {}",
                 truncate(&ep.path, 30),
                 &ep.method,
                 "*", "*", "*", "*",
                 "allow",
-                &ep.handler
+                truncate(&ep.handler, 20),
+                location
             );
         } else {
-            // Show each matching rule
-            for (i, rule) in matching_rules.iter().enumerate() {
-                let handler = if i == 0 { &ep.handler } else { "" };
-                println!("{:<30} {:<7}  {:>12}, {:>6}, {:>15}, {:>12} | {:<6}  ({})",
-                    if i == 0 { truncate(&ep.path, 30) } else { "".to_string() },
-                    if i == 0 { &ep.method } else { "" },
-                    truncate(&rule.role_mask, 12),
-                    truncate(&rule.id, 6),
-                    truncate(&rule.ip, 15),
-                    truncate(&rule.time, 12),
-                    &rule.action,
-                    handler
+            let rule = matching_rules[0];
+            println!("{:<30} {:<7}  {:>10}, {:>4}, {:>12}, {:>8} | {:<6}  {:<20} {}",
+                truncate(&ep.path, 30),
+                &ep.method,
+                truncate(&rule.role_mask, 10),
+                truncate(&rule.id, 4),
+                truncate(&rule.ip, 12),
+                truncate(&rule.time, 8),
+                &rule.action,
+                truncate(&ep.handler, 20),
+                location
+            );
+            for rule in matching_rules.iter().skip(1) {
+                println!("{:<30} {:<7}  {:>10}, {:>4}, {:>12}, {:>8} | {:<6}",
+                    "", "",
+                    truncate(&rule.role_mask, 10),
+                    truncate(&rule.id, 4),
+                    truncate(&rule.ip, 12),
+                    truncate(&rule.time, 8),
+                    &rule.action
                 );
             }
         }
     }
 
     println!("\n{} endpoints, {} ACL rules", endpoints.len(), acl_rules.len());
+}
+
+fn print_csv(endpoints: &[Endpoint], acl_rules: &[AclRule]) {
+    // CSV header
+    println!("endpoint,method,role,id,ip,time,action,handler,file,line");
+
+    let mut sorted_endpoints = endpoints.to_vec();
+    sorted_endpoints.sort_by(|a, b| a.path.cmp(&b.path).then(a.method.cmp(&b.method)));
+
+    for ep in &sorted_endpoints {
+        let matching_rules: Vec<&AclRule> = acl_rules.iter()
+            .filter(|r| r.matches_path(&ep.path))
+            .collect();
+
+        if matching_rules.is_empty() {
+            println!("{},{},*,*,*,*,allow,{},{},{}",
+                escape_csv(&ep.path),
+                &ep.method,
+                escape_csv(&ep.handler),
+                escape_csv(&ep.file),
+                ep.line
+            );
+        } else {
+            for rule in &matching_rules {
+                println!("{},{},{},{},{},{},{},{},{},{}",
+                    escape_csv(&ep.path),
+                    &ep.method,
+                    escape_csv(&rule.role_mask),
+                    escape_csv(&rule.id),
+                    escape_csv(&rule.ip),
+                    escape_csv(&rule.time),
+                    &rule.action,
+                    escape_csv(&ep.handler),
+                    escape_csv(&ep.file),
+                    ep.line
+                );
+            }
+        }
+    }
+}
+
+fn print_toml(endpoints: &[Endpoint], acl_rules: &[AclRule]) {
+    println!("# Generated ACL configuration");
+    println!("# {} endpoints, {} rules\n", endpoints.len(), acl_rules.len());
+
+    println!("[settings]");
+    println!("default_action = \"deny\"\n");
+
+    let mut sorted_endpoints = endpoints.to_vec();
+    sorted_endpoints.sort_by(|a, b| a.path.cmp(&b.path).then(a.method.cmp(&b.method)));
+
+    // Group by unique rules
+    let mut seen_rules: Vec<String> = Vec::new();
+
+    for ep in &sorted_endpoints {
+        let matching_rules: Vec<&AclRule> = acl_rules.iter()
+            .filter(|r| r.matches_path(&ep.path))
+            .collect();
+
+        if matching_rules.is_empty() {
+            // Generate a rule for unrestricted endpoint
+            let rule_key = format!("{}:*", ep.path);
+            if !seen_rules.contains(&rule_key) {
+                seen_rules.push(rule_key);
+                println!("[[rules]]");
+                println!("endpoint = \"{}\"", ep.path);
+                println!("role_mask = \"*\"");
+                println!("action = \"allow\"");
+                println!("# handler: {} ({}:{})", ep.handler, short_path(&ep.file), ep.line);
+                println!();
+            }
+        } else {
+            for rule in &matching_rules {
+                let rule_key = format!("{}:{}:{}:{}:{}",
+                    rule.pattern, rule.role_mask, rule.id, rule.ip, rule.time);
+                if !seen_rules.contains(&rule_key) {
+                    seen_rules.push(rule_key);
+                    println!("[[rules]]");
+                    println!("endpoint = \"{}\"", rule.pattern);
+                    if rule.role_mask != "*" {
+                        println!("role_mask = {}", rule.role_mask);
+                    } else {
+                        println!("role_mask = \"*\"");
+                    }
+                    if rule.id != "*" {
+                        println!("id = \"{}\"", rule.id);
+                    }
+                    if rule.ip != "*" {
+                        println!("ip = \"{}\"", rule.ip);
+                    }
+                    if rule.time != "*" {
+                        println!("# time = \"{}\"", rule.time);
+                    }
+                    println!("action = \"{}\"", rule.action);
+                    println!();
+                }
+            }
+        }
+    }
+}
+
+fn escape_csv(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+fn short_path(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -946,16 +1081,26 @@ fn print_help() {
     println!("Usage: endpoint_parser [OPTIONS] <directory>");
     println!();
     println!("Output format:");
-    println!("  ENDPOINT METHOD  ROLE, ID, IP, TIME | ACTION  (handler)");
+    println!("  ENDPOINT METHOD  ROLE, ID, IP, TIME | ACTION  HANDLER  file:line");
     println!("  * = any/wildcard");
     println!();
     println!("Options:");
-    println!("  --text   Use text-based parsing (default, fast)");
+    println!("  --text    Use text-based parsing (default, fast)");
     #[cfg(feature = "ast-parser")]
-    println!("  --ast    Use AST-based parsing (more accurate)");
+    println!("  --ast     Use AST-based parsing (more accurate)");
     #[cfg(not(feature = "ast-parser"))]
-    println!("  --ast    Use AST-based parsing (requires --features ast-parser)");
-    println!("  --help   Show this help message");
+    println!("  --ast     Use AST-based parsing (requires --features ast-parser)");
+    println!();
+    println!("  --table   Output as formatted table (default)");
+    println!("  --csv     Output as CSV");
+    println!("  --toml    Output as TOML config file");
+    println!();
+    println!("  --help    Show this help message");
+    println!();
+    println!("Examples:");
+    println!("  endpoint_parser examples/");
+    println!("  endpoint_parser --csv examples/ > endpoints.csv");
+    println!("  endpoint_parser --toml examples/ > acl.toml");
 }
 
 fn main() {
@@ -967,12 +1112,16 @@ fn main() {
     }
 
     let mut mode = ParseMode::Text;
+    let mut format = OutputFormat::Table;
     let mut dir_path: Option<PathBuf> = None;
 
     for arg in &args {
         match arg.as_str() {
             "--text" => mode = ParseMode::Text,
             "--ast" => mode = ParseMode::Ast,
+            "--table" => format = OutputFormat::Table,
+            "--csv" => format = OutputFormat::Csv,
+            "--toml" => format = OutputFormat::Toml,
             "--help" => {
                 print_help();
                 return;
@@ -989,15 +1138,18 @@ fn main() {
 
     let dir = dir_path.unwrap_or_else(|| PathBuf::from("src"));
 
-    println!("Parsing axum endpoints in: {}", dir.display());
-    println!("Mode: {:?}\n", mode);
+    // Only print header for table format
+    if format == OutputFormat::Table {
+        eprintln!("Parsing axum endpoints in: {}", dir.display());
+        eprintln!("Mode: {:?}\n", mode);
+    }
 
     match mode {
         ParseMode::Text => {
             let mut parser = text_parser::TextParser::new();
             parser.parse_dir(&dir);
             parser.resolve_nests();
-            print_results(&parser.endpoints, &parser.acl_rules);
+            print_results(&parser.endpoints, &parser.acl_rules, format);
         }
         ParseMode::Ast => {
             #[cfg(feature = "ast-parser")]
@@ -1005,7 +1157,7 @@ fn main() {
                 let mut parser = ast_parser::AstParser::new();
                 parser.parse_dir(&dir);
                 parser.resolve_nests();
-                print_results(&parser.endpoints, &parser.acl_rules);
+                print_results(&parser.endpoints, &parser.acl_rules, format);
             }
             #[cfg(not(feature = "ast-parser"))]
             {
