@@ -1,11 +1,14 @@
 //! ACL middleware implementation for axum.
 //!
 //! This module provides the [`AclLayer`] and [`AclMiddleware`] types that
-//! integrate with axum's middleware system.
+//! integrate with axum's middleware system, as well as the generic
+//! [`GenericAclLayer`] and [`GenericAclMiddleware`] for custom auth types.
 
 use crate::error::{AccessDenied, AccessDeniedHandler, DefaultDeniedHandler};
-use crate::extractor::{HeaderIdExtractor, HeaderRoleExtractor, IdExtractor, RoleExtractor};
-use crate::rule::{AclAction, RequestContext};
+use crate::extractor::{
+    AuthExtractor, AuthResult, HeaderIdExtractor, HeaderRoleExtractor, IdExtractor, RoleExtractor,
+};
+use crate::rule::{AclAction, BitmaskAuth, RequestMeta};
 use crate::table::AclTable;
 
 use axum::extract::ConnectInfo;
@@ -13,10 +16,15 @@ use axum::response::Response;
 use futures_util::future::BoxFuture;
 use http::{Request, StatusCode};
 use http_body::Body;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
+
+// ============================================================================
+// Legacy Middleware (BitmaskAuth via RoleExtractor + IdExtractor)
+// ============================================================================
 
 /// Configuration for the ACL middleware.
 pub struct AclConfig<E, I> {
@@ -236,18 +244,15 @@ where
         let config = self.config.clone();
         let mut inner = self.inner.clone();
 
-        // Extract roles bitmask synchronously before entering the async block
         let role_result = config.role_extractor.extract_roles(&request);
         let roles = role_result.roles_or(config.anonymous_roles);
 
-        // Extract client IP synchronously
         let client_ip = extract_client_ip(&request, config.forwarded_ip_header.as_deref());
 
-        // Extract user/session ID using the configured extractor
         let id_result = config.id_extractor.extract_id(&request);
         let id = id_result.id_or(&config.default_id);
 
-        // Get request path
+        let method = request.method().clone();
         let path = request.uri().path().to_string();
 
         Box::pin(async move {
@@ -260,131 +265,285 @@ where
                 return Ok(response);
             };
 
-            // Build request context
-            let ctx = RequestContext::new(roles, client_ip, &id);
+            let auth = BitmaskAuth {
+                roles,
+                id: id.clone(),
+            };
+            let meta = RequestMeta {
+                method,
+                path: path.clone(),
+                path_params: HashMap::new(),
+                ip: client_ip,
+            };
 
-            // Evaluate ACL
-            let action = config.table.evaluate(&path, &ctx);
+            let action = config.table.evaluate_request(&auth, &meta);
 
-            match action {
-                AclAction::Allow => {
-                    tracing::trace!(
-                        roles = roles,
-                        id = %id,
-                        path = %path,
-                        ip = %client_ip,
-                        "ACL allowed request"
-                    );
-                    inner.call(request).await
-                }
-                AclAction::Deny => {
-                    tracing::info!(
-                        roles = roles,
-                        id = %id,
-                        path = %path,
-                        ip = %client_ip,
-                        "ACL denied request"
-                    );
-
-                    let denied = AccessDenied::new_with_roles(roles, path, id);
-                    let response = config.denied_handler.handle(&denied);
-
-                    // Convert the response body type
-                    let (parts, _body) = response.into_parts();
-                    let response = Response::from_parts(parts, ResBody::default());
-
-                    Ok(response)
-                }
-                AclAction::Error { code, ref message } => {
-                    tracing::info!(
-                        roles = roles,
-                        id = %id,
-                        path = %path,
-                        ip = %client_ip,
-                        code = code,
-                        message = ?message,
-                        "ACL returned error"
-                    );
-
-                    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN);
-
-                    let response = Response::builder()
-                        .status(status)
-                        .header("content-type", "text/plain")
-                        .body(ResBody::default())
-                        .unwrap();
-
-                    Ok(response)
-                }
-                AclAction::Reroute { ref target, preserve_path } => {
-                    tracing::info!(
-                        roles = roles,
-                        id = %id,
-                        path = %path,
-                        ip = %client_ip,
-                        target = %target,
-                        "ACL rerouting request"
-                    );
-
-                    // For reroute, we return a redirect response
-                    let mut response = Response::builder()
-                        .status(StatusCode::TEMPORARY_REDIRECT)
-                        .header("location", target.as_str())
-                        .body(ResBody::default())
-                        .unwrap();
-
-                    if preserve_path {
-                        response.headers_mut().insert(
-                            "x-original-path",
-                            path.parse().unwrap_or_else(|_| "/".parse().unwrap()),
-                        );
-                    }
-
-                    Ok(response)
-                }
-                AclAction::RateLimit { max_requests, window_secs } => {
-                    // Rate limiting requires external state management
-                    // For now, just log and allow - users should implement their own rate limiter
-                    tracing::warn!(
-                        roles = roles,
-                        id = %id,
-                        path = %path,
-                        ip = %client_ip,
-                        max_requests = max_requests,
-                        window_secs = window_secs,
-                        "ACL rate limit action - not implemented, allowing request"
-                    );
-                    inner.call(request).await
-                }
-                AclAction::Log { ref level, ref message } => {
-                    let msg = message.clone().unwrap_or_else(|| {
-                        format!("ACL log: roles={}, id={}, path={}, ip={}", roles, id, path, client_ip)
-                    });
-
-                    match level.as_str() {
-                        "trace" => tracing::trace!("{}", msg),
-                        "debug" => tracing::debug!("{}", msg),
-                        "warn" => tracing::warn!("{}", msg),
-                        "error" => tracing::error!("{}", msg),
-                        _ => tracing::info!("{}", msg),
-                    }
-
-                    // Log action allows the request to proceed
-                    inner.call(request).await
-                }
-            }
+            handle_action(action, &path, &id, roles, client_ip, &config.denied_handler, request, &mut inner).await
         })
+    }
+}
+
+// ============================================================================
+// Generic Middleware (custom auth type via AuthExtractor)
+// ============================================================================
+
+/// Configuration for the generic ACL middleware.
+pub struct GenericAclConfig<A, X> {
+    /// The ACL table containing the rules.
+    pub table: Arc<AclTable<A>>,
+    /// The auth extractor.
+    pub auth_extractor: Arc<X>,
+    /// The handler for access denied responses.
+    pub denied_handler: Arc<dyn AccessDeniedHandler>,
+    /// Header to check for forwarded IP (e.g., X-Forwarded-For).
+    pub forwarded_ip_header: Option<String>,
+}
+
+impl<A, X> Clone for GenericAclConfig<A, X> {
+    fn clone(&self) -> Self {
+        Self {
+            table: self.table.clone(),
+            auth_extractor: self.auth_extractor.clone(),
+            denied_handler: self.denied_handler.clone(),
+            forwarded_ip_header: self.forwarded_ip_header.clone(),
+        }
+    }
+}
+
+/// A Tower layer for the generic ACL middleware.
+#[derive(Clone)]
+pub struct GenericAclLayer<A, X> {
+    config: GenericAclConfig<A, X>,
+}
+
+impl<A, X> GenericAclLayer<A, X> {
+    /// Create a new generic ACL layer.
+    pub fn with_auth(table: AclTable<A>, extractor: X) -> Self {
+        Self {
+            config: GenericAclConfig {
+                table: Arc::new(table),
+                auth_extractor: Arc::new(extractor),
+                denied_handler: Arc::new(DefaultDeniedHandler),
+                forwarded_ip_header: None,
+            },
+        }
+    }
+
+    /// Set a custom access denied handler.
+    pub fn with_denied_handler(
+        mut self,
+        handler: impl AccessDeniedHandler + 'static,
+    ) -> Self {
+        self.config.denied_handler = Arc::new(handler);
+        self
+    }
+
+    /// Set a header to extract the client IP from.
+    pub fn with_forwarded_ip_header(mut self, header: impl Into<String>) -> Self {
+        self.config.forwarded_ip_header = Some(header.into());
+        self
+    }
+}
+
+impl<S, A: Clone, X: Clone> Layer<S> for GenericAclLayer<A, X> {
+    type Service = GenericAclMiddleware<S, A, X>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        GenericAclMiddleware {
+            inner,
+            config: self.config.clone(),
+        }
+    }
+}
+
+/// The generic ACL middleware service.
+#[derive(Clone)]
+pub struct GenericAclMiddleware<S, A, X> {
+    inner: S,
+    config: GenericAclConfig<A, X>,
+}
+
+impl<S, A, X, ReqBody, ResBody> Service<Request<ReqBody>> for GenericAclMiddleware<S, A, X>
+where
+    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send,
+    A: Send + Sync + 'static,
+    X: AuthExtractor<A, ReqBody> + 'static,
+    ReqBody: Body + Send + 'static,
+    ResBody: Body + Default + Send + 'static,
+{
+    type Response = Response<ResBody>;
+    type Error = S::Error;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request<ReqBody>) -> Self::Future {
+        let config = self.config.clone();
+        let mut inner = self.inner.clone();
+
+        let auth_result = config.auth_extractor.extract_auth(&request);
+        let client_ip = extract_client_ip(&request, config.forwarded_ip_header.as_deref());
+        let method = request.method().clone();
+        let path = request.uri().path().to_string();
+
+        Box::pin(async move {
+            let Some(client_ip) = client_ip else {
+                tracing::warn!("Failed to extract client IP address");
+                let response = Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(ResBody::default())
+                    .unwrap();
+                return Ok(response);
+            };
+
+            let meta = RequestMeta {
+                method,
+                path: path.clone(),
+                path_params: HashMap::new(),
+                ip: client_ip,
+            };
+
+            let action = match auth_result {
+                AuthResult::Auth(auth) => config.table.evaluate_request(&auth, &meta),
+                AuthResult::Anonymous => config.table.default_action(),
+                AuthResult::Error(e) => {
+                    tracing::warn!(error = %e, "Auth extraction failed");
+                    AclAction::Deny
+                }
+            };
+
+            handle_action(action, &path, "*", 0, client_ip, &config.denied_handler, request, &mut inner).await
+        })
+    }
+}
+
+// ============================================================================
+// Shared Helpers
+// ============================================================================
+
+/// Handle an ACL action, producing the appropriate response.
+async fn handle_action<S, ReqBody, ResBody>(
+    action: AclAction,
+    path: &str,
+    id: &str,
+    roles: u32,
+    client_ip: IpAddr,
+    denied_handler: &Arc<dyn AccessDeniedHandler>,
+    request: Request<ReqBody>,
+    inner: &mut S,
+) -> Result<Response<ResBody>, S::Error>
+where
+    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send,
+    ResBody: Body + Default + Send + 'static,
+{
+    match action {
+        AclAction::Allow => {
+            tracing::trace!(
+                path = %path,
+                ip = %client_ip,
+                "ACL allowed request"
+            );
+            inner.call(request).await
+        }
+        AclAction::Deny => {
+            tracing::info!(
+                path = %path,
+                ip = %client_ip,
+                "ACL denied request"
+            );
+
+            let denied = AccessDenied::new_with_roles(roles, path, id);
+            let response = denied_handler.handle(&denied);
+            let (parts, _body) = response.into_parts();
+            let response = Response::from_parts(parts, ResBody::default());
+            Ok(response)
+        }
+        AclAction::Error { code, ref message } => {
+            tracing::info!(
+                path = %path,
+                ip = %client_ip,
+                code = code,
+                message = ?message,
+                "ACL returned error"
+            );
+
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN);
+            let response = Response::builder()
+                .status(status)
+                .header("content-type", "text/plain")
+                .body(ResBody::default())
+                .unwrap();
+            Ok(response)
+        }
+        AclAction::Reroute {
+            ref target,
+            preserve_path,
+        } => {
+            tracing::info!(
+                path = %path,
+                ip = %client_ip,
+                target = %target,
+                "ACL rerouting request"
+            );
+
+            let mut response = Response::builder()
+                .status(StatusCode::TEMPORARY_REDIRECT)
+                .header("location", target.as_str())
+                .body(ResBody::default())
+                .unwrap();
+
+            if preserve_path {
+                response.headers_mut().insert(
+                    "x-original-path",
+                    path.parse().unwrap_or_else(|_| "/".parse().unwrap()),
+                );
+            }
+
+            Ok(response)
+        }
+        AclAction::RateLimit {
+            max_requests,
+            window_secs,
+        } => {
+            tracing::warn!(
+                path = %path,
+                ip = %client_ip,
+                max_requests = max_requests,
+                window_secs = window_secs,
+                "ACL rate limit action - not implemented, allowing request"
+            );
+            inner.call(request).await
+        }
+        AclAction::Log {
+            ref level,
+            ref message,
+        } => {
+            let msg = message.clone().unwrap_or_else(|| {
+                format!("ACL log: path={}, ip={}", path, client_ip)
+            });
+
+            match level.as_str() {
+                "trace" => tracing::trace!("{}", msg),
+                "debug" => tracing::debug!("{}", msg),
+                "warn" => tracing::warn!("{}", msg),
+                "error" => tracing::error!("{}", msg),
+                _ => tracing::info!("{}", msg),
+            }
+
+            inner.call(request).await
+        }
     }
 }
 
 /// Extract the client IP address from the request.
 fn extract_client_ip<B>(request: &Request<B>, forwarded_header: Option<&str>) -> Option<IpAddr> {
-    // First, check the forwarded header if configured
     if let Some(header_name) = forwarded_header {
         if let Some(value) = request.headers().get(header_name) {
             if let Ok(s) = value.to_str() {
-                // X-Forwarded-For format: client, proxy1, proxy2, ...
-                // Take the first (leftmost) IP
                 if let Some(first_ip) = s.split(',').next() {
                     if let Ok(ip) = first_ip.trim().parse::<IpAddr>() {
                         return Some(ip);
@@ -394,7 +553,6 @@ fn extract_client_ip<B>(request: &Request<B>, forwarded_header: Option<&str>) ->
         }
     }
 
-    // Fall back to ConnectInfo
     request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()

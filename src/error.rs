@@ -15,6 +15,8 @@ pub struct AccessDenied {
     pub id: String,
     /// Optional custom message.
     pub message: Option<String>,
+    /// Optional description of the auth context (for non-bitmask auth types).
+    pub auth_info: Option<String>,
 }
 
 impl AccessDenied {
@@ -25,6 +27,7 @@ impl AccessDenied {
             path: path.into(),
             id: id.into(),
             message: None,
+            auth_info: None,
         }
     }
 
@@ -35,6 +38,7 @@ impl AccessDenied {
             path: path.into(),
             id: "*".to_string(),
             message: None,
+            auth_info: None,
         }
     }
 

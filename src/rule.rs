@@ -10,7 +10,9 @@
 //! - **ID**: Exact match or "*" wildcard
 
 use chrono::{Datelike, NaiveTime, Utc};
+use http::Method;
 use ipnetwork::IpNetwork;
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 /// Request context for ACL evaluation.
@@ -28,6 +30,48 @@ impl<'a> RequestContext<'a> {
     /// Create a new request context.
     pub fn new(roles: u32, ip: IpAddr, id: &'a str) -> Self {
         Self { roles, ip, id }
+    }
+}
+
+/// The legacy bitmask-based auth context.
+///
+/// Wraps the old `(roles: u32, id: String)` pair for use with the generic
+/// `RuleMatcher<A>` system. `AclRuleFilter` implements `RuleMatcher<BitmaskAuth>`.
+#[derive(Debug, Clone)]
+pub struct BitmaskAuth {
+    /// Role bitmask (u32).
+    pub roles: u32,
+    /// User/session ID.
+    pub id: String,
+}
+
+/// Metadata about the incoming HTTP request, available to all matchers.
+#[derive(Debug, Clone)]
+pub struct RequestMeta {
+    /// HTTP method (GET, POST, etc.)
+    pub method: Method,
+    /// Request path.
+    pub path: String,
+    /// Named path parameters extracted from the matching `EndpointPattern`.
+    pub path_params: HashMap<String, String>,
+    /// Client IP address.
+    pub ip: IpAddr,
+}
+
+/// Trait for matching a rule against an auth context and request metadata.
+///
+/// `A` is the application-specific auth type (e.g., `BitmaskAuth`, or a custom
+/// scoped-role struct). Implementations decide how to check authorization.
+pub trait RuleMatcher<A>: Send + Sync + std::fmt::Debug {
+    /// Check if this matcher allows the given auth context for the request.
+    fn matches(&self, auth: &A, meta: &RequestMeta) -> bool;
+
+    /// The action to take if this matcher matches.
+    fn action(&self) -> &AclAction;
+
+    /// Optional human-readable description for logging.
+    fn description(&self) -> Option<&str> {
+        None
     }
 }
 
@@ -125,6 +169,8 @@ pub struct AclRuleFilter {
     pub id: String,
     /// Role bitmask: `(rule.role_mask & ctx.roles) != 0` to match.
     pub role_mask: u32,
+    /// HTTP methods this rule applies to. Empty means all methods.
+    pub methods: Vec<Method>,
     /// Time window: start < now < end.
     pub time: TimeWindow,
     /// IP matcher: CIDR-style matching.
@@ -141,6 +187,7 @@ impl AclRuleFilter {
         Self {
             id: "*".to_string(),
             role_mask: u32::MAX, // all roles
+            methods: Vec::new(),
             time: TimeWindow::default(),
             ip: IpMatcher::Any,
             action: AclAction::Allow,
@@ -169,6 +216,18 @@ impl AclRuleFilter {
     /// Add a role bit to the mask.
     pub fn add_role(mut self, role_id: u8) -> Self {
         self.role_mask |= 1 << role_id;
+        self
+    }
+
+    /// Set the HTTP methods this rule applies to. Empty means all methods.
+    pub fn methods(mut self, methods: Vec<Method>) -> Self {
+        self.methods = methods;
+        self
+    }
+
+    /// Add an HTTP method this rule applies to.
+    pub fn method(mut self, method: Method) -> Self {
+        self.methods.push(method);
         self
     }
 
@@ -215,6 +274,24 @@ impl AclRuleFilter {
 impl Default for AclRuleFilter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl RuleMatcher<BitmaskAuth> for AclRuleFilter {
+    fn matches(&self, auth: &BitmaskAuth, meta: &RequestMeta) -> bool {
+        (self.methods.is_empty() || self.methods.contains(&meta.method))
+            && (self.id == "*" || self.id == auth.id)
+            && (self.role_mask & auth.roles) != 0
+            && self.ip.matches(&meta.ip)
+            && self.time.matches_now()
+    }
+
+    fn action(&self) -> &AclAction {
+        &self.action
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
     }
 }
 
@@ -575,6 +652,66 @@ impl EndpointPattern {
         Self::extract_id_from_parts(&pattern_parts, &path_parts)
     }
 
+    /// Extract all named path parameters from a path given this pattern.
+    ///
+    /// Returns a map of parameter names to their values.
+    ///
+    /// # Example
+    /// ```
+    /// use axum_acl::EndpointPattern;
+    ///
+    /// let pattern = EndpointPattern::glob("/api/{resource}/{id}");
+    /// let params = pattern.extract_named_params("/api/boat/123");
+    /// assert_eq!(params.get("resource").map(|s| s.as_str()), Some("boat"));
+    /// assert_eq!(params.get("id").map(|s| s.as_str()), Some("123"));
+    /// ```
+    pub fn extract_named_params(&self, path: &str) -> HashMap<String, String> {
+        match self {
+            Self::Glob(pattern) => {
+                let pattern_parts: Vec<&str> =
+                    pattern.split('/').filter(|s| !s.is_empty()).collect();
+                let path_parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+                let mut params = HashMap::new();
+                Self::collect_named_params(&pattern_parts, &path_parts, &mut params);
+                params
+            }
+            _ => HashMap::new(),
+        }
+    }
+
+    fn collect_named_params<'a>(
+        pattern: &[&str],
+        path: &[&'a str],
+        params: &mut HashMap<String, String>,
+    ) {
+        let mut pi = 0;
+        let mut qi = 0;
+        while pi < pattern.len() && qi < path.len() {
+            let seg = pattern[pi];
+            if seg == "**" {
+                if pi + 1 >= pattern.len() {
+                    return;
+                }
+                // skip ahead in path until remaining pattern matches
+                for skip in qi..=path.len() {
+                    let mut trial = HashMap::new();
+                    Self::collect_named_params(&pattern[pi + 1..], &path[skip..], &mut trial);
+                    if !trial.is_empty() || (pi + 1 == pattern.len() - 1 && skip < path.len()) {
+                        params.extend(trial);
+                        return;
+                    }
+                }
+                return;
+            }
+            if seg.starts_with('{') && seg.ends_with('}') {
+                let name = &seg[1..seg.len() - 1];
+                params.insert(name.to_string(), path[qi].to_string());
+            }
+            pi += 1;
+            qi += 1;
+        }
+    }
+
     fn extract_id_from_parts(pattern: &[&str], path: &[&str]) -> Option<String> {
         if pattern.is_empty() || path.is_empty() {
             return None;
@@ -733,5 +870,78 @@ mod tests {
         // Wildcard matches any ID
         let ctx = RequestContext::new(0b1, ip, "anyone");
         assert!(filter.matches(&ctx));
+    }
+
+    #[test]
+    fn test_extract_named_params() {
+        let pattern = EndpointPattern::glob("/api/{resource}/{id}/details");
+        let params = pattern.extract_named_params("/api/boat/123/details");
+        assert_eq!(params.get("resource").map(|s| s.as_str()), Some("boat"));
+        assert_eq!(params.get("id").map(|s| s.as_str()), Some("123"));
+
+        let pattern = EndpointPattern::glob("/api/groups/{group_id}/factions/{faction_id}");
+        let params = pattern.extract_named_params("/api/groups/abc-123/factions/def-456");
+        assert_eq!(params.get("group_id").map(|s| s.as_str()), Some("abc-123"));
+        assert_eq!(params.get("faction_id").map(|s| s.as_str()), Some("def-456"));
+
+        // Non-glob returns empty
+        let pattern = EndpointPattern::exact("/api/users");
+        let params = pattern.extract_named_params("/api/users");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_rule_matcher_bitmask_auth() {
+        let filter = AclRuleFilter::new()
+            .role_mask(0b001)
+            .action(AclAction::Allow);
+
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let meta = RequestMeta {
+            method: Method::GET,
+            path: "/api/users".to_string(),
+            path_params: HashMap::new(),
+            ip,
+        };
+
+        let auth = BitmaskAuth { roles: 0b001, id: "*".to_string() };
+        assert!(RuleMatcher::matches(&filter, &auth, &meta));
+
+        let auth = BitmaskAuth { roles: 0b010, id: "*".to_string() };
+        assert!(!RuleMatcher::matches(&filter, &auth, &meta));
+    }
+
+    #[test]
+    fn test_rule_matcher_method_filtering() {
+        let filter = AclRuleFilter::new()
+            .role_mask(u32::MAX)
+            .method(Method::POST)
+            .action(AclAction::Allow);
+
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let auth = BitmaskAuth { roles: 0b1, id: "*".to_string() };
+
+        let meta_post = RequestMeta {
+            method: Method::POST,
+            path: "/api/users".to_string(),
+            path_params: HashMap::new(),
+            ip,
+        };
+        assert!(RuleMatcher::matches(&filter, &auth, &meta_post));
+
+        let meta_get = RequestMeta {
+            method: Method::GET,
+            path: "/api/users".to_string(),
+            path_params: HashMap::new(),
+            ip,
+        };
+        assert!(!RuleMatcher::matches(&filter, &auth, &meta_get));
+
+        // Empty methods = all methods
+        let filter_any = AclRuleFilter::new()
+            .role_mask(u32::MAX)
+            .action(AclAction::Allow);
+        assert!(RuleMatcher::matches(&filter_any, &auth, &meta_get));
+        assert!(RuleMatcher::matches(&filter_any, &auth, &meta_post));
     }
 }

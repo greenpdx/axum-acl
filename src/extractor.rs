@@ -44,6 +44,7 @@
 //! Path: /api/boat/boat-456/size  -> DENIED (id doesn't match)
 //! ```
 
+use crate::rule::BitmaskAuth;
 use http::Request;
 use std::sync::Arc;
 
@@ -545,6 +546,84 @@ impl AnonymousIdExtractor {
 impl<B> IdExtractor<B> for AnonymousIdExtractor {
     fn extract_id(&self, _request: &Request<B>) -> IdExtractionResult {
         IdExtractionResult::Anonymous
+    }
+}
+
+// ============================================================================
+// Generic Auth Extraction
+// ============================================================================
+
+/// Result of generic auth extraction.
+#[derive(Debug, Clone)]
+pub enum AuthResult<A> {
+    /// Auth context was successfully extracted.
+    Auth(A),
+    /// No auth could be extracted (anonymous/guest).
+    Anonymous,
+    /// An error occurred during extraction.
+    Error(String),
+}
+
+/// Trait for extracting a generic auth context from HTTP requests.
+///
+/// `A` is the auth type your ACL rules use.
+/// `B` is the request body type.
+pub trait AuthExtractor<A, B>: Send + Sync {
+    /// Extract auth context from the request.
+    fn extract_auth(&self, request: &Request<B>) -> AuthResult<A>;
+}
+
+/// Adapter that combines a `RoleExtractor` and `IdExtractor` into
+/// an `AuthExtractor<BitmaskAuth, B>`.
+pub struct BitmaskAuthExtractor<E, I> {
+    role_extractor: E,
+    id_extractor: I,
+    anonymous_roles: u32,
+    default_id: String,
+}
+
+impl<E, I> BitmaskAuthExtractor<E, I> {
+    /// Create a new adapter from existing extractors.
+    pub fn new(role_extractor: E, id_extractor: I) -> Self {
+        Self {
+            role_extractor,
+            id_extractor,
+            anonymous_roles: 0,
+            default_id: "*".to_string(),
+        }
+    }
+
+    /// Set the roles bitmask to use for anonymous users.
+    pub fn with_anonymous_roles(mut self, roles: u32) -> Self {
+        self.anonymous_roles = roles;
+        self
+    }
+
+    /// Set the default ID when the ID extractor returns anonymous.
+    pub fn with_default_id(mut self, id: impl Into<String>) -> Self {
+        self.default_id = id.into();
+        self
+    }
+}
+
+impl<E: std::fmt::Debug, I: std::fmt::Debug> std::fmt::Debug for BitmaskAuthExtractor<E, I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BitmaskAuthExtractor")
+            .field("role_extractor", &self.role_extractor)
+            .field("id_extractor", &self.id_extractor)
+            .finish()
+    }
+}
+
+impl<E, I, B> AuthExtractor<BitmaskAuth, B> for BitmaskAuthExtractor<E, I>
+where
+    E: RoleExtractor<B>,
+    I: IdExtractor<B>,
+{
+    fn extract_auth(&self, request: &Request<B>) -> AuthResult<BitmaskAuth> {
+        let roles = self.role_extractor.extract_roles(request).roles_or(self.anonymous_roles);
+        let id = self.id_extractor.extract_id(request).id_or(&self.default_id);
+        AuthResult::Auth(BitmaskAuth { roles, id })
     }
 }
 

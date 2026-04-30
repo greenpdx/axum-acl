@@ -1,6 +1,6 @@
 [package]
 name = "axum-acl"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Flexible ACL middleware for axum 0.8 with 5-tuple rule matching (endpoint, role, id, ip, time)"

@@ -273,7 +273,10 @@ mod rule;
 mod table;
 
 // Re-export main types
-pub use config::{AclConfig as TomlConfig, ConfigError, ConfigSettings, RuleConfig};
+pub use config::{
+    AclConfig as TomlConfig, ConfigError, ConfigSettings, MatcherConfig, MatcherRegistry,
+    RuleConfig,
+};
 pub use error::{AccessDenied, AccessDeniedHandler, AclError, DefaultDeniedHandler, JsonDeniedHandler};
 pub use extractor::{
     // Role extraction
@@ -282,10 +285,19 @@ pub use extractor::{
     // ID extraction
     AnonymousIdExtractor, ExtensionIdExtractor, FixedIdExtractor, HeaderIdExtractor,
     IdExtractionResult, IdExtractor,
+    // Generic auth extraction
+    AuthExtractor, AuthResult, BitmaskAuthExtractor,
 };
-pub use middleware::{AclConfig, AclLayer, AclMiddleware};
-pub use rule::{AclAction, AclRuleFilter, EndpointPattern, IpMatcher, RequestContext, TimeWindow};
-pub use table::{AclRuleProvider, AclTable, AclTableBuilder, RuleEntry, StaticRuleProvider};
+pub use middleware::{
+    AclConfig, AclLayer, AclMiddleware, GenericAclConfig, GenericAclLayer, GenericAclMiddleware,
+};
+pub use rule::{
+    AclAction, AclRuleFilter, BitmaskAuth, EndpointPattern, IpMatcher, RequestContext, RequestMeta,
+    RuleMatcher, TimeWindow,
+};
+pub use table::{
+    AclRule, AclRuleProvider, AclTable, AclTableBuilder, RuleEntry, StaticRuleProvider,
+};
 
 /// Prelude module for convenient imports.
 ///
@@ -296,11 +308,14 @@ pub mod prelude {
     pub use crate::config::ConfigError;
     pub use crate::error::{AccessDenied, AccessDeniedHandler, AclError};
     pub use crate::extractor::{
-        HeaderRoleExtractor, RoleExtractionResult, RoleExtractor,
-        HeaderIdExtractor, IdExtractionResult, IdExtractor,
+        AuthExtractor, AuthResult, BitmaskAuthExtractor, HeaderIdExtractor, HeaderRoleExtractor,
+        IdExtractionResult, IdExtractor, RoleExtractionResult, RoleExtractor,
     };
-    pub use crate::middleware::AclLayer;
-    pub use crate::rule::{AclAction, AclRuleFilter, EndpointPattern, IpMatcher, RequestContext, TimeWindow};
-    pub use crate::table::{AclRuleProvider, AclTable, RuleEntry};
+    pub use crate::middleware::{AclLayer, GenericAclLayer};
+    pub use crate::rule::{
+        AclAction, AclRuleFilter, BitmaskAuth, EndpointPattern, IpMatcher, RequestContext,
+        RequestMeta, RuleMatcher, TimeWindow,
+    };
+    pub use crate::table::{AclRule, AclRuleProvider, AclTable, RuleEntry};
     pub use crate::ROLE_ANONYMOUS;
 }

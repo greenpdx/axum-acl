@@ -48,10 +48,11 @@
 //! let table = AclTable::from_toml_file("config/acl.toml").unwrap();
 //! ```
 
-use crate::rule::{AclAction, AclRuleFilter, EndpointPattern, IpMatcher, TimeWindow};
-use crate::table::AclTable;
+use crate::rule::{AclAction, AclRuleFilter, EndpointPattern, IpMatcher, RuleMatcher, TimeWindow};
+use crate::table::{AclRule, AclTable};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::Arc;
 
 /// Configuration file structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +127,12 @@ pub struct RuleConfig {
     /// Priority (lower = higher priority). Rules are sorted by priority.
     #[serde(default = "default_priority")]
     pub priority: i32,
+
+    /// Custom matcher configuration (for use with `MatcherRegistry`).
+    /// When present and a registry is provided, this is used instead of
+    /// `role_mask`/`id`/`ip`/`time` for building the matcher.
+    #[serde(default)]
+    pub matcher: Option<MatcherConfig>,
 }
 
 /// Role mask configuration - can be a number or string.
@@ -254,6 +261,29 @@ pub enum ComplexAction {
         #[serde(default)]
         message: Option<String>,
     },
+}
+
+/// Configuration for a custom matcher (used with `MatcherRegistry`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MatcherConfig {
+    /// A named matcher reference (e.g., `"authenticated"`).
+    Named(String),
+    /// A parameterized matcher (e.g., `{ type = "scoped_role", param = "id" }`).
+    Parameterized {
+        /// The matcher type name.
+        #[serde(rename = "type")]
+        matcher_type: String,
+        /// Optional parameter name (e.g., path parameter to bind to).
+        #[serde(default)]
+        param: Option<String>,
+    },
+}
+
+/// Registry that resolves `MatcherConfig` values into `RuleMatcher<A>` instances.
+pub trait MatcherRegistry<A>: Send + Sync {
+    /// Resolve a matcher config into a boxed `RuleMatcher`.
+    fn resolve(&self, config: &MatcherConfig) -> Result<Arc<dyn RuleMatcher<A>>, ConfigError>;
 }
 
 fn default_error_code() -> u16 {
@@ -474,9 +504,16 @@ fn rule_config_to_filter(config: RuleConfig) -> AclRuleFilter {
 
     let action = action_config_to_action(&config.action);
 
+    let methods: Vec<http::Method> = config
+        .methods
+        .iter()
+        .filter_map(|m| m.parse::<http::Method>().ok())
+        .collect();
+
     let mut filter = AclRuleFilter::new()
         .id(config.id)
         .role_mask(config.role_mask.to_mask())
+        .methods(methods)
         .time(time)
         .ip(ip)
         .action(action);
@@ -486,6 +523,86 @@ fn rule_config_to_filter(config: RuleConfig) -> AclRuleFilter {
     }
 
     filter
+}
+
+impl AclConfig {
+    /// Convert configuration into a generic `AclTable<A>` using a `MatcherRegistry`.
+    ///
+    /// Rules with a `matcher` field are resolved via the registry.
+    /// Rules without a `matcher` field are skipped (they only work with the
+    /// bitmask-based `into_table()` method).
+    pub fn into_generic_table<A: Send + Sync + 'static>(
+        self,
+        registry: &dyn MatcherRegistry<A>,
+    ) -> Result<AclTable<A>, ConfigError> {
+        let default_action = action_config_to_action(&self.settings.default_action);
+
+        let mut rules: Vec<(i32, RuleConfig)> = self
+            .rules
+            .into_iter()
+            .map(|r| (r.priority, r))
+            .collect();
+        rules.sort_by_key(|(p, _)| *p);
+
+        let mut exact_rules: std::collections::HashMap<String, Vec<AclRule<A>>> =
+            std::collections::HashMap::new();
+        let mut pattern_rules: Vec<(EndpointPattern, Vec<AclRule<A>>)> = Vec::new();
+
+        for (_, rule_config) in rules {
+            let Some(ref matcher_config) = rule_config.matcher else {
+                continue;
+            };
+
+            let matcher = registry.resolve(matcher_config)?;
+
+            let methods: Vec<http::Method> = rule_config
+                .methods
+                .iter()
+                .filter_map(|m| m.parse::<http::Method>().ok())
+                .collect();
+
+            let action = action_config_to_action(&rule_config.action);
+
+            let rule = if methods.is_empty() {
+                AclRule::from_matcher(matcher)
+            } else {
+                AclRule::from_matcher_with_methods(matcher, methods, action)
+            };
+
+            let endpoint = EndpointPattern::parse(&rule_config.endpoint);
+            match endpoint {
+                EndpointPattern::Exact(path) => {
+                    exact_rules.entry(path).or_default().push(rule);
+                }
+                pattern => {
+                    let mut found = false;
+                    for (existing, rules) in &mut pattern_rules {
+                        let is_match = match (existing, &pattern) {
+                            (EndpointPattern::Any, EndpointPattern::Any) => true,
+                            (EndpointPattern::Prefix(a), EndpointPattern::Prefix(b)) => a == b,
+                            (EndpointPattern::Glob(a), EndpointPattern::Glob(b)) => a == b,
+                            (EndpointPattern::Exact(a), EndpointPattern::Exact(b)) => a == b,
+                            _ => false,
+                        };
+                        if is_match {
+                            rules.push(rule.clone());
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        pattern_rules.push((pattern, vec![rule]));
+                    }
+                }
+            }
+        }
+
+        Ok(AclTable {
+            exact_rules,
+            pattern_rules,
+            default_action,
+        })
+    }
 }
 
 impl AclTable {
@@ -624,12 +741,14 @@ action = "allow"
         let config = AclConfig::from_toml(toml).unwrap();
         let table = config.into_table();
 
-        // Check the filter has correct IP matcher
-        let (_, filters) = &table.pattern_rules()[0];
-        match &filters[0].ip {
-            IpMatcher::Network(_) => {}
-            _ => panic!("Expected Network IP matcher"),
-        }
+        // Verify IP filtering works via evaluation
+        let internal_ip: IpAddr = "192.168.1.50".parse().unwrap();
+        let external_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let ctx_internal = RequestContext::new(u32::MAX, internal_ip, "*");
+        let ctx_external = RequestContext::new(u32::MAX, external_ip, "*");
+
+        assert_eq!(table.evaluate("/internal/foo", &ctx_internal), AclAction::Allow);
+        assert_eq!(table.evaluate("/internal/foo", &ctx_external), AclAction::Deny);
     }
 
     #[test]
