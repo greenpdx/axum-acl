@@ -87,6 +87,15 @@ curl -H "X-Roles: 2" http://localhost:3000/admin/dashboard
 curl -H "X-Roles: 1" http://localhost:3000/admin/dashboard
 ```
 
+> ⚠️ **Security:** `AclLayer::new` reads roles and IDs from the **client-settable
+> `X-Roles` / `X-User-Id` headers** (as the curl examples show). Any caller can
+> send `X-Roles: 1` and claim that role, so this default is for local testing
+> only. In production, install a role extractor that *verifies* the caller —
+> e.g. validates a signed session or JWT — via
+> [`with_role_extractor`](#custom-role-translation). Likewise, only enable
+> `with_forwarded_ip_header` behind a proxy you control: the client IP is taken
+> from the rightmost `X-Forwarded-For` entry (the one your proxy appends).
+
 ## TOML Configuration
 
 Define rules in TOML format - either embedded at compile-time or loaded from a file at startup.

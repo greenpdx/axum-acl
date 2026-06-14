@@ -274,6 +274,13 @@ impl AclTable<BitmaskAuth> {
     ///
     /// For each endpoint match, filters are checked: id → roles → ip → time
     ///
+    /// # Note
+    ///
+    /// This convenience API evaluates as an HTTP `GET` request, so
+    /// method-filtered rules (`AclRuleFilter::method`) are not honored here.
+    /// For method-aware evaluation, build a [`RequestMeta`] with the real
+    /// method and call [`evaluate_request`](AclTable::evaluate_request).
+    ///
     /// # Example
     /// ```
     /// use axum_acl::{AclTable, AclRuleFilter, AclAction, RequestContext};
@@ -656,6 +663,49 @@ mod tests {
             "/shared",
             &RequestContext::new(ROLE_ADMIN | ROLE_USER, ip, "au")
         ));
+    }
+
+    #[test]
+    fn test_id_ownership_via_path_param() {
+        // `{id}` in the endpoint must be matched against the caller's id so a
+        // user can only reach their own resource.
+        let table = AclTable::builder()
+            .default_action(AclAction::Deny)
+            .add_glob(
+                "/api/boat/{id}/**",
+                AclRuleFilter::new()
+                    .role_mask(u32::MAX)
+                    .id("{id}")
+                    .action(AclAction::Allow),
+            )
+            .build();
+
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let meta = |path: &str| RequestMeta {
+            method: http::Method::GET,
+            path: path.to_string(),
+            path_params: HashMap::new(),
+            ip,
+        };
+
+        let owner = BitmaskAuth { roles: 0b1, id: "boat-123".to_string() };
+        let other = BitmaskAuth { roles: 0b1, id: "boat-999".to_string() };
+
+        // Owner reaches their own resource.
+        assert_eq!(
+            table.evaluate_request(&owner, &meta("/api/boat/boat-123/size")),
+            AclAction::Allow
+        );
+        // A different user is denied (not just defaulted by a never-matching rule).
+        assert_eq!(
+            table.evaluate_request(&other, &meta("/api/boat/boat-123/size")),
+            AclAction::Deny
+        );
+        // Owner cannot reach someone else's resource either.
+        assert_eq!(
+            table.evaluate_request(&owner, &meta("/api/boat/boat-999/size")),
+            AclAction::Deny
+        );
     }
 
     #[test]

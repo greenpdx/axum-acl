@@ -102,7 +102,22 @@ impl AclLayer<HeaderRoleExtractor, HeaderIdExtractor> {
     /// Uses the default header role extractor (`X-Roles` header),
     /// default header ID extractor (`X-User-Id` header), and
     /// default denied handler (plain text 403).
+    ///
+    /// # Security
+    ///
+    /// The default role/ID source is **client-settable HTTP headers**
+    /// (`X-Roles`, `X-User-Id`). Any caller can send `X-Roles: 1` and claim
+    /// that role, so this default is suitable only for local testing. In
+    /// production, install a role extractor that *verifies* the caller (e.g.
+    /// validates a signed session/JWT) via [`with_role_extractor`].
+    ///
+    /// [`with_role_extractor`]: AclLayer::with_role_extractor
     pub fn new(table: AclTable) -> Self {
+        tracing::warn!(
+            "AclLayer::new uses the client-settable `X-Roles`/`X-User-Id` headers \
+             for authorization, which any caller can forge. Use \
+             `with_role_extractor` with a verifying extractor in production."
+        );
         Self {
             config: AclConfig {
                 table: Arc::new(table),
@@ -253,7 +268,7 @@ where
         let id = id_result.id_or(&config.default_id);
 
         let method = request.method().clone();
-        let path = request.uri().path().to_string();
+        let path = normalize_path(request.uri().path());
 
         Box::pin(async move {
             let Some(client_ip) = client_ip else {
@@ -297,6 +312,9 @@ pub struct GenericAclConfig<A, X> {
     pub denied_handler: Arc<dyn AccessDeniedHandler>,
     /// Header to check for forwarded IP (e.g., X-Forwarded-For).
     pub forwarded_ip_header: Option<String>,
+    /// Auth value used to evaluate anonymous requests against the table.
+    /// When `None`, anonymous requests use the table's default action.
+    pub anonymous_auth: Option<Arc<A>>,
 }
 
 impl<A, X> Clone for GenericAclConfig<A, X> {
@@ -306,6 +324,7 @@ impl<A, X> Clone for GenericAclConfig<A, X> {
             auth_extractor: self.auth_extractor.clone(),
             denied_handler: self.denied_handler.clone(),
             forwarded_ip_header: self.forwarded_ip_header.clone(),
+            anonymous_auth: self.anonymous_auth.clone(),
         }
     }
 }
@@ -325,6 +344,7 @@ impl<A, X> GenericAclLayer<A, X> {
                 auth_extractor: Arc::new(extractor),
                 denied_handler: Arc::new(DefaultDeniedHandler),
                 forwarded_ip_header: None,
+                anonymous_auth: None,
             },
         }
     }
@@ -341,6 +361,16 @@ impl<A, X> GenericAclLayer<A, X> {
     /// Set a header to extract the client IP from.
     pub fn with_forwarded_ip_header(mut self, header: impl Into<String>) -> Self {
         self.config.forwarded_ip_header = Some(header.into());
+        self
+    }
+
+    /// Set the auth value used to evaluate anonymous requests against the rule
+    /// table. Without this, anonymous requests fall through to the table's
+    /// default action and never match a rule — so public rules cannot allow
+    /// them. Provide an "anonymous" auth value (e.g. one carrying a guest role)
+    /// to evaluate them consistently with authenticated requests.
+    pub fn with_anonymous_auth(mut self, auth: A) -> Self {
+        self.config.anonymous_auth = Some(Arc::new(auth));
         self
     }
 }
@@ -387,7 +417,7 @@ where
         let auth_result = config.auth_extractor.extract_auth(&request);
         let client_ip = extract_client_ip(&request, config.forwarded_ip_header.as_deref());
         let method = request.method().clone();
-        let path = request.uri().path().to_string();
+        let path = normalize_path(request.uri().path());
 
         Box::pin(async move {
             let Some(client_ip) = client_ip else {
@@ -408,7 +438,10 @@ where
 
             let action = match auth_result {
                 AuthResult::Auth(auth) => config.table.evaluate_request(&auth, &meta),
-                AuthResult::Anonymous => config.table.default_action(),
+                AuthResult::Anonymous => match config.anonymous_auth.as_ref() {
+                    Some(a) => config.table.evaluate_request(a.as_ref(), &meta),
+                    None => config.table.default_action(),
+                },
                 AuthResult::Error(e) => {
                     tracing::warn!(error = %e, "Auth extraction failed");
                     AclAction::Deny
@@ -509,14 +542,21 @@ where
             max_requests,
             window_secs,
         } => {
+            // No backing limiter exists yet. Fail CLOSED (deny) rather than
+            // open: a rule authored with a restrictive intent must never
+            // silently allow the request.
             tracing::warn!(
                 path = %path,
                 ip = %client_ip,
                 max_requests = max_requests,
                 window_secs = window_secs,
-                "ACL rate limit action - not implemented, allowing request"
+                "ACL rate limit action is not implemented; failing closed (deny)"
             );
-            inner.call(request).await
+
+            let denied = AccessDenied::new_with_roles(roles, path, id);
+            let response = denied_handler.handle(&denied);
+            let (parts, _body) = response.into_parts();
+            Ok(Response::from_parts(parts, ResBody::default()))
         }
         AclAction::Log {
             ref level,
@@ -540,12 +580,18 @@ where
 }
 
 /// Extract the client IP address from the request.
+///
+/// When a forwarded header is configured, the **rightmost** entry is used: that
+/// is the value appended by the nearest (trusted) proxy. The leftmost entries
+/// are supplied by the client and are therefore spoofable, so trusting them
+/// would let an attacker forge the IP seen by IP-based rules. Only enable a
+/// forwarded header when the service runs behind a proxy you control.
 fn extract_client_ip<B>(request: &Request<B>, forwarded_header: Option<&str>) -> Option<IpAddr> {
     if let Some(header_name) = forwarded_header {
         if let Some(value) = request.headers().get(header_name) {
             if let Ok(s) = value.to_str() {
-                if let Some(first_ip) = s.split(',').next() {
-                    if let Ok(ip) = first_ip.trim().parse::<IpAddr>() {
+                if let Some(rightmost_ip) = s.rsplit(',').next() {
+                    if let Ok(ip) = rightmost_ip.trim().parse::<IpAddr>() {
                         return Some(ip);
                     }
                 }
@@ -559,8 +605,64 @@ fn extract_client_ip<B>(request: &Request<B>, forwarded_header: Option<&str>) ->
         .map(|ci| ci.0.ip())
 }
 
+/// Normalize a request path before ACL matching so the table sees the same
+/// logical path the router resolves. Without this, a rule keyed on
+/// `/admin/secret` can be bypassed via `/admin/secret/` (trailing slash),
+/// `/admin//secret` (duplicate slash), or `/admin/%73ecret` (percent-encoding).
+///
+/// Percent-decodes, collapses empty segments, and drops the trailing slash
+/// (root stays `/`). Rule endpoints should be written in this canonical form.
+fn normalize_path(path: &str) -> String {
+    let decoded = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+    let mut out = String::with_capacity(decoded.len() + 1);
+    out.push('/');
+    for seg in decoded.split('/').filter(|s| !s.is_empty()) {
+        if out.len() > 1 {
+            out.push('/');
+        }
+        out.push_str(seg);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    // Tests for middleware are integration tests in examples/
-    // Unit tests would require mocking axum's Body type
+    use super::{extract_client_ip, normalize_path};
+    use http::Request;
+
+    #[test]
+    fn normalize_path_closes_bypasses() {
+        assert_eq!(normalize_path("/admin/secret"), "/admin/secret");
+        // trailing slash
+        assert_eq!(normalize_path("/admin/secret/"), "/admin/secret");
+        // duplicate slashes
+        assert_eq!(normalize_path("/admin//secret"), "/admin/secret");
+        assert_eq!(normalize_path("//admin/secret"), "/admin/secret");
+        // percent-encoding (%73 == 's')
+        assert_eq!(normalize_path("/admin/%73ecret"), "/admin/secret");
+        // encoded slash collapses to a real separator, not a smuggled segment
+        assert_eq!(normalize_path("/admin%2f%2fsecret"), "/admin/secret");
+        // root / empty
+        assert_eq!(normalize_path("/"), "/");
+        assert_eq!(normalize_path(""), "/");
+    }
+
+    #[test]
+    fn forwarded_ip_uses_rightmost_entry() {
+        // The leftmost entry is client-supplied; the rightmost is appended by
+        // our trusted proxy and must be the one we trust.
+        let req = Request::builder()
+            .header("x-forwarded-for", "1.1.1.1, 2.2.2.2, 3.3.3.3")
+            .body(())
+            .unwrap();
+        let ip = extract_client_ip(&req, Some("x-forwarded-for")).unwrap();
+        assert_eq!(ip.to_string(), "3.3.3.3");
+    }
+
+    #[test]
+    fn no_ip_sources_yields_none() {
+        let req = Request::builder().body(()).unwrap();
+        assert!(extract_client_ip(&req, Some("x-forwarded-for")).is_none());
+        assert!(extract_client_ip(&req, None).is_none());
+    }
 }

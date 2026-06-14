@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **Path normalization before matching** - the request path is now percent-decoded
+  and its slashes collapsed before rule evaluation, closing authorization bypasses
+  via trailing slashes, duplicate slashes, and percent-encoding
+  (e.g. `/admin/secret/`, `/admin//secret`, `/admin/%73ecret`).
+- **`X-Forwarded-For` now uses the rightmost entry** (the value appended by the
+  trusted proxy) instead of the spoofable client-supplied leftmost entry, so
+  IP-based rules can't be bypassed by forging the header.
+- **`RateLimit` action now fails closed (deny)** instead of silently allowing the
+  request while unimplemented.
+
+### Fixed
+
+- **`{id}` ownership matching now works** - `AclRuleFilter` with `.id("{id}")` now
+  resolves the path parameter from the matched endpoint and compares it to the
+  caller's id. Previously such rules never matched (denied everyone) and ownership
+  could not be enforced through the middleware.
+- **Generic middleware can evaluate anonymous requests** against the table via the
+  new `GenericAclLayer::with_anonymous_auth`, instead of always short-circuiting to
+  the default action.
+
+### Documentation
+
+- Security warning on `AclLayer::new` and the README quick-start that the default
+  `X-Roles`/`X-User-Id` headers are client-settable and must not be trusted in
+  production.
+- Note that the legacy `AclTable::evaluate` API evaluates as `GET` and does not
+  honor method-filtered rules.
+
 ## [0.2.0] - 2025-12-04
 
 ### Added
