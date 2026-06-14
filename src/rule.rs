@@ -269,6 +269,26 @@ impl AclRuleFilter {
             // 4. Time match
             && self.time.matches_now()
     }
+
+    /// Match this rule's `id` against the caller's id for a given request.
+    ///
+    /// Supports three forms:
+    /// - `"*"` — matches any caller.
+    /// - `"{param}"` — ownership: resolves `param` from the matched endpoint's
+    ///   path parameters (e.g. `{id}` from `/api/x/{id}/**`) and requires it to
+    ///   equal the caller's id. If the parameter wasn't captured, it does not
+    ///   match (fails closed).
+    /// - any other string — exact match against the caller's id.
+    fn id_matches(&self, caller_id: &str, meta: &RequestMeta) -> bool {
+        if self.id == "*" {
+            return true;
+        }
+        if self.id.len() >= 2 && self.id.starts_with('{') && self.id.ends_with('}') {
+            let key = &self.id[1..self.id.len() - 1];
+            return meta.path_params.get(key).is_some_and(|v| v == caller_id);
+        }
+        self.id == caller_id
+    }
 }
 
 impl Default for AclRuleFilter {
@@ -280,7 +300,7 @@ impl Default for AclRuleFilter {
 impl RuleMatcher<BitmaskAuth> for AclRuleFilter {
     fn matches(&self, auth: &BitmaskAuth, meta: &RequestMeta) -> bool {
         (self.methods.is_empty() || self.methods.contains(&meta.method))
-            && (self.id == "*" || self.id == auth.id)
+            && self.id_matches(&auth.id, meta)
             && (self.role_mask & auth.roles) != 0
             && self.ip.matches(&meta.ip)
             && self.time.matches_now()
